@@ -164,7 +164,7 @@ pickup:
   cooldown: 0.5
 
 # ---------------------------------------------------------------------------
-# AoE: 默认仅 A；F2 用 attack_combo: [s, a]
+# AoE: 默认仅 A；F2 用 attack_style: jump_attack（空中跳打时序）
 # ---------------------------------------------------------------------------
 aoe_skill:
   range_x: 400
@@ -228,6 +228,10 @@ lie_alert:
   record_clip: true
   record_dir: "_debug_out/lie_clips"
   record_fps: 30
+  # YOLO 跟形时主循环常掉到 ~8–15fps；旧逻辑按墙钟补重复帧，一次最多垫 ~2.5s
+  # 静帧，回看就像帧率崩了（上次素材近 85% 近重复）。默认不补，一帧采集写一帧。
+  record_pad_wallclock: false
+  record_pad_max_frames: 2       # 若开启补帧，单次最多重复几帧
   record_preroll_s: 1.5
   record_preroll_fps: 10         # 挂机时预录采样；别跟截图同帧 copy，否则越挂越卡
   record_postroll_s: 4.0         # 弹窗关闭后再多录几秒，避免收尾被掐
@@ -273,14 +277,14 @@ lie_alert:
   template_weight: 0.50
   mouse_smooth: 0.92                # 跟形更贴目标；大跳变代码里会硬吸
   lose_target_grace_s: 2.0
-  # 只拦开场倒计时/提示；不要写「移动鼠标」——常驻说明「移动鼠标跟随…」会整场误拦跟形
+  # 只拦开场倒计时；follow_ready 后不再跑 OCR 门控（会卡主线程导致晚吸鼠）
+  # 不要写「移动鼠标/放置在」——常驻说明条会整场误拦
   intro_ocr_block_keywords:
     - "2秒后"
     - "3秒后"
     - "1秒后"
     - "测谎小游戏开始"
     - "请前往安全地点"
-    - "放置在"
 
 
 profiles:
@@ -325,24 +329,37 @@ profiles:
       text: "甩锅侠12138"
       template: "character/name_12138.png"
     aoe_skill:
-      attack_combo: ["s", "a"]         # S=跳，0.1s 后 A=空中攻击
-      combo_gap: 0.1                   # 起跳后 0.1s 空中 A
-      cooldown_min: 0.8               # 每次跳跃间隔 0.8s
-      cooldown_max: 0.8
+      # 空中跳打时序：按住 S → 空中延迟 → 按住 A → 松 S → 间隙 → 松 A
+      attack_style: jump_attack
+      attack_combo: ["s", "a"]
+      jump_key: "s"
+      skill_key: "a"
+      jump_air_delay: 0.08             # 起跳后到按 A
+      skill_hold: 0.12                 # 空中按住 A
+      skill_release_gap: 0.12          # 松跳后到松 A
+      jump_interval_min: 0.35          # 轮次间隔
+      jump_interval_max: 0.50
+      cooldown_min: 0.35
+      cooldown_max: 0.50
     walk_teleport:
       enable: false                    # 本任务不能闪现，取消 Z
     bot:
       flash_patrol: true
     directional_attack:
       station_hold: false
-      # 云彩公园：黄点 10%~80% 左右巡逻（右界收窄10%）；到边立刻强制掉头。不加怪物转向。
-      search_left_ratio: 0.10           # yellow left bound (~80% width span)
-      search_right_ratio: 0.80          # yellow right bound  # narrowed 10% from 0.90
-      search_edge_margin: 0.02          # force band acts like 0.12/0.88 (flip earlier)
-      search_edge_stall_frames: 10      # ~0.3s@30fps: no X progress near third -> flip
-      search_edge_stall_third: 0.40     # left/right third of minimap for stall flip
-      search_edge_stall_min_delta_px: 1.0
-      search_wall_rehold_frames: 45     # 顶墙重按降频，避免 F2 卡顿
+      # 云彩公园：黄点中区巡逻；跳打容易冲墙，软界+提前量+贴墙卡滞一起收紧。
+      search_left_ratio: 0.12           # yellow left soft bound
+      search_right_ratio: 0.75          # yellow right soft bound
+      search_edge_margin: 0.06          # force ≈ 0.18 / 0.69
+      search_approach_margin: 0.05      # 仍朝该墙走时再提前 ~5% 掉头（防跳打过冲）
+      search_flip_attack_pause_s: 0.28  # 掉头后先走路，暂停跳打一瞬
+      search_wall_screen_agree: true    # 名字牌也贴同侧屏边时补强强制掉头
+      search_wall_screen_ratio: 0.88
+      search_edge_stall_frames: 6       # ~0.2s@30fps: 近界无位移 -> 掉头
+      search_edge_stall_third: 0.50
+      search_edge_stall_bound_band: 0.10 # 软界内侧 10% 也算近界
+      search_edge_stall_min_delta_px: 0.8
+      search_wall_rehold_frames: 30     # 贴墙时更勤重按反向键
       search_stall_frames: 0            # disable mid-band stall thrash (edge-stall above)
       search_stall_min_delta_px: 2.0
       search_dir_sticky_frames: 90      # mid-band sticky; bound turns immediate

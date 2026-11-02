@@ -1937,38 +1937,59 @@ class MonsterDetector:
         Returns (force_left, force_right, detail).
 
         CRITICAL: when minimap yellow is available, bound forces use YELLOW
-        ONLY. A frozen/false nameplate locked near screen-right (s≈0.91) used
-        to fire mid_force_left as soon as yellow left the far-left band
-        (yr>0.30), trapping patrol in the left half forever. Screen is a
-        fallback only when yellow is missing this frame.
+        ONLY for hard cuts. A frozen/false nameplate locked near screen-right
+        (s≈0.91) used to fire mid_force_left as soon as yellow left the
+        far-left band (yr>0.30), trapping patrol in the left half forever.
+
+        Screen may only *agree* with yellow on the same side (wall stick),
+        never override yellow alone toward the opposite half.
         """
         force_left = False
         force_right = False
         bits = []
         yr = None
         sr = None
+        mm_cfg = self.cfg.get("directional_attack", {}) or {}
+        edge_margin = float(mm_cfg.get("search_edge_margin", 0.02))
+        # Extra inward band while still walking toward that wall (jump overshoot).
+        approach = float(mm_cfg.get("search_approach_margin", 0.04))
+        hunt_dir = str(getattr(self, "_hunt_search_dir", "") or "")
 
         if self.loc_player_minimap is not None and self.img_minimap is not None:
             mm_w = float(self.img_minimap.shape[1])
             if mm_w > 1:
                 raw_x = float(self.loc_player_minimap[0])
                 yr = raw_x / mm_w
-                # Symmetric edge bands. edge_margin pulls the force band inward so
-                # we flip before the physical wall (and before border-reject kills
-                # the real diamond). Default 0.02 => 0.10/0.90 act like 0.12/0.88.
-                mm_cfg = self.cfg.get("directional_attack", {}) or {}
-                edge_margin = float(mm_cfg.get("search_edge_margin", 0.02))
+                # edge_margin pulls force band inward so we flip before the
+                # physical wall. approach flips even earlier when still heading
+                # into that wall (jump_attack overshoot).
                 left_cut = float(left_ratio) + max(0.0, edge_margin)
                 right_cut = float(right_ratio) - max(0.0, edge_margin)
                 if right_cut <= left_cut:
                     left_cut = float(left_ratio)
                     right_cut = float(right_ratio)
+                left_approach = left_cut + max(0.0, approach)
+                right_approach = right_cut - max(0.0, approach)
+                if right_approach <= left_approach:
+                    left_approach, right_approach = left_cut, right_cut
+
                 if yr >= right_cut or raw_x >= (mm_w * right_cut):
                     force_left = True
                     bits.append(f"yellow_right:{yr:.2f}")
+                elif hunt_dir == "right" and (
+                    yr >= right_approach or raw_x >= (mm_w * right_approach)
+                ):
+                    force_left = True
+                    bits.append(f"yellow_right_approach:{yr:.2f}")
+
                 if yr <= left_cut or raw_x <= max(3.0, mm_w * left_cut):
                     force_right = True
                     bits.append(f"yellow_left:{yr:.2f}")
+                elif hunt_dir == "left" and (
+                    yr <= left_approach or raw_x <= max(3.0, mm_w * left_approach)
+                ):
+                    force_right = True
+                    bits.append(f"yellow_left_approach:{yr:.2f}")
 
         src = str(getattr(self, "_player_src", "") or "")
         name_ok = src.startswith("name") or src.startswith("title")
@@ -1983,6 +2004,10 @@ class MonsterDetector:
             if fw > 1:
                 sr = float(self.loc_player[0]) / fw
 
+        screen_edge = float(mm_cfg.get("search_wall_screen_ratio", 0.88))
+        screen_edge = min(0.95, max(0.70, screen_edge))
+        agree = bool(mm_cfg.get("search_wall_screen_agree", True))
+
         if yr is None and have_name and sr is not None:
             # Yellow missing: screen fallback (symmetric).
             if sr >= float(right_ratio):
@@ -1992,7 +2017,24 @@ class MonsterDetector:
                 force_right = True
                 bits.append(f"screen_left:{sr:.2f}")
         elif yr is not None and have_name and sr is not None:
-            # Log contradictions only; never let screen override yellow.
+            # Agree-only: character visually jammed on that screen edge AND
+            # yellow already on that same half → treat as wall stick.
+            if agree:
+                if (
+                    sr >= screen_edge
+                    and yr >= 0.55
+                    and (hunt_dir == "right" or yr >= float(right_ratio) - 0.10)
+                ):
+                    force_left = True
+                    bits.append(f"screen_agree_right:s={sr:.2f},y={yr:.2f}")
+                if (
+                    sr <= (1.0 - screen_edge)
+                    and yr <= 0.45
+                    and (hunt_dir == "left" or yr <= float(left_ratio) + 0.10)
+                ):
+                    force_right = True
+                    bits.append(f"screen_agree_left:s={sr:.2f},y={yr:.2f}")
+            # Log contradictions only; never let screen alone override yellow.
             if (sr >= float(right_ratio) and yr < 0.55) or (
                 sr <= float(left_ratio) and yr > 0.45
             ):
@@ -2122,11 +2164,13 @@ class MonsterDetector:
                             self._hunt_edge_enter_side = None
 
                     # Edge-stall: raw yellow not progressing toward current dir while
-                    # already in that third of the minimap. Catches false yellow locks
-                    # (~x=30-45) while the char is already pressing the physical wall.
+                    # already near that mid-zone bound (or map third). Catches false
+                    # yellow locks while the char is pressing a physical wall / pad.
                     edge_stall_n = max(0, int(cfg.get("search_edge_stall_frames", 10)))
                     edge_stall_third = float(cfg.get("search_edge_stall_third", 0.40))
                     edge_stall_min_delta = float(cfg.get("search_edge_stall_min_delta_px", 1.0))
+                    # Bound-relative stall band (ratio of span); default ~8% past soft bound.
+                    stall_band = float(cfg.get("search_edge_stall_bound_band", 0.08))
                     edge_stall_hit = False
                     if raw_mm_x is not None and edge_stall_n > 0 and span_w > 0:
                         last_raw = getattr(self, "_hunt_edge_last_raw_x", None)
@@ -2147,10 +2191,18 @@ class MonsterDetector:
                             self._hunt_edge_stall_frames = 0
                         self._hunt_edge_last_raw_x = raw_mm_x
                         _yr2 = raw_mm_x / span_w
+                        near_left = _yr2 <= max(
+                            edge_stall_third,
+                            float(left_ratio) + max(0.0, stall_band),
+                        )
+                        near_right = _yr2 >= min(
+                            1.0 - edge_stall_third,
+                            float(right_ratio) - max(0.0, stall_band),
+                        )
                         if self._hunt_edge_stall_frames >= edge_stall_n:
-                            if self._hunt_search_dir == "left" and _yr2 <= edge_stall_third:
+                            if self._hunt_search_dir == "left" and near_left:
                                 edge_stall_hit = True
-                            elif self._hunt_search_dir == "right" and _yr2 >= (1.0 - edge_stall_third):
+                            elif self._hunt_search_dir == "right" and near_right:
                                 edge_stall_hit = True
                     elif raw_mm_x is not None:
                         self._hunt_edge_last_raw_x = raw_mm_x
@@ -2215,6 +2267,18 @@ class MonsterDetector:
                             if raw_mm_x is not None:
                                 self._hunt_smooth_x = float(raw_mm_x)
                             _patrol_force_dir(desired)
+                            # Brief attack pause so jump_attack does not immediately
+                            # leap back into the wall; walk away one step first.
+                            try:
+                                kb = getattr(self, "_kb", None)
+                                pause_s = float(cfg.get("search_flip_attack_pause_s", 0.25))
+                                if kb is not None and pause_s > 0:
+                                    kb._attack_pause_until = max(
+                                        float(getattr(kb, "_attack_pause_until", 0.0)),
+                                        _time.time() + pause_s,
+                                    )
+                            except Exception:
+                                pass
                             raw_s = f"{raw_mm_x:.1f}" if raw_mm_x is not None else "na"
                             enter_t = getattr(self, "_hunt_edge_enter_t", None)
                             dt_ms = (

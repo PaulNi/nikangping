@@ -1098,6 +1098,101 @@ class KeyBoardController:
                 _pynput_kb.release(Key.down)
             self._last_up_down = ud
 
+    def _jc_sleep(self, seconds: float, token0: int) -> bool:
+        """Sleep in slices; return False if AFK stopped or direction flipped."""
+        end = time.time() + max(0.0, float(seconds))
+        while time.time() < end:
+            try:
+                self._poll_profile_hotkeys()
+            except Exception:
+                pass
+            if not getattr(self, "is_enable", False):
+                return False
+            if self.is_lie_alert_frozen() or self.is_buff_frozen():
+                return False
+            if int(getattr(self, "_dir_override_token", 0)) != token0:
+                return False
+            time.sleep(min(0.04, max(0.0, end - time.time())))
+        return True
+
+    def _jc_rehold_dir(self):
+        lr = self.cmd_left_right
+        if lr in ("left", "right"):
+            try:
+                key_down(lr)
+            except Exception:
+                pass
+            self._last_left_right = lr
+            self._t_last_dir_reassert = time.time()
+
+    def _execute_air_jump_attack(self, jump_key: str, skill_key: str, aoe_cfg: dict) -> bool:
+        """
+        Air jump timing: hold jump → air delay → hold skill → release jump
+        → release gap → release skill. Direction arrow stays held.
+        """
+        air = max(0.0, float(aoe_cfg.get("jump_air_delay", 0.08)))
+        skill_hold = max(0.02, float(aoe_cfg.get("skill_hold", 0.12)))
+        rel_gap = max(0.0, float(aoe_cfg.get("skill_release_gap", 0.12)))
+        token0 = int(getattr(self, "_dir_override_token", 0))
+
+        def _kd(k: str):
+            with self._send_lock:
+                self._ensure_game_focus(force=False)
+                key_down(k)
+
+        def _ku(k: str):
+            with self._send_lock:
+                try:
+                    key_up(k)
+                except Exception:
+                    pass
+
+        try:
+            _kd(jump_key)
+            if not self._jc_sleep(air, token0):
+                _ku(jump_key)
+                self._jc_rehold_dir()
+                return False
+            _kd(skill_key)
+            if not self._jc_sleep(skill_hold, token0):
+                _ku(jump_key)
+                _ku(skill_key)
+                self._jc_rehold_dir()
+                return False
+            _ku(jump_key)
+            if not self._jc_sleep(rel_gap, token0):
+                _ku(skill_key)
+                self._jc_rehold_dir()
+                return False
+            _ku(skill_key)
+            self._jc_rehold_dir()
+        except Exception:
+            try:
+                _ku(jump_key)
+                _ku(skill_key)
+            except Exception:
+                pass
+            self._jc_rehold_dir()
+            return False
+        return True
+
+    def _do_jump_attack(self, aoe_cfg: dict) -> float:
+        """One air-jump attack; returns next cooldown seconds."""
+        combo = aoe_cfg.get("attack_combo") or ["s", "a"]
+        jump_key = str(aoe_cfg.get("jump_key") or (combo[0] if combo else self.key_jump))
+        skill_key = str(
+            aoe_cfg.get("skill_key")
+            or (combo[1] if len(combo) > 1 else self.key_aoe_skill)
+        )
+        ok = self._execute_air_jump_attack(jump_key, skill_key, aoe_cfg)
+        cd_lo = float(aoe_cfg.get("jump_interval_min", aoe_cfg.get("cooldown_min", 0.35)))
+        cd_hi = float(aoe_cfg.get("jump_interval_max", aoe_cfg.get("cooldown_max", 0.50)))
+        if cd_hi < cd_lo:
+            cd_lo, cd_hi = cd_hi, cd_lo
+        if not ok:
+            return max(0.15, cd_lo * 0.5)
+        return random.uniform(cd_lo, cd_hi)
+
     def _apply_action(self):
         """Apply one-shot actions only once per command change."""
         # Force heal overrides normal action
@@ -1134,6 +1229,7 @@ class KeyBoardController:
             if self.cmd_action == "aoe" or self.attack_mode == "aoe_skill":
                 atk_key = self.key_aoe_skill
                 aoe_cfg = self.cfg.get("aoe_skill", {}) or {}
+                style = str(aoe_cfg.get("attack_style", "") or "").strip().lower()
                 cd_min = float(aoe_cfg.get("cooldown_min", aoe_cfg.get("cooldown", 0.5)))
                 cd_max = float(aoe_cfg.get("cooldown_max", aoe_cfg.get("cooldown", 1.5)))
                 if cd_max < cd_min:
@@ -1144,12 +1240,22 @@ class KeyBoardController:
                 atk_cd = self._aoe_next_cd
             else:
                 atk_key = self.key_directional_attack
+                aoe_cfg = {}
+                style = ""
                 atk_cd = self.cfg.get("directional_attack", {}).get("cooldown", 0.9)
 
             t_now = time.time()
             if t_now - self._t_last_attack >= float(atk_cd):
-                # Optional combo e.g. ["s","a"] with combo_gap between keys (F2)
                 aoe_cfg = self.cfg.get("aoe_skill", {}) or {}
+                style = str(aoe_cfg.get("attack_style", "") or "").strip().lower()
+                if style in ("jump_cruise", "jump_attack", "cruise"):
+                    next_cd = self._do_jump_attack(aoe_cfg)
+                    self._t_last_attack = time.time()
+                    self._aoe_next_cd = float(next_cd)
+                    self._attack_count += 1
+                    return
+
+                # Optional combo e.g. ["s","a"] with combo_gap between keys (legacy F2)
                 combo = aoe_cfg.get("attack_combo") or []
                 if isinstance(combo, (list, tuple)) and len(combo) > 0:
                     gap = float(aoe_cfg.get("combo_gap", 0.2))

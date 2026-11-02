@@ -278,6 +278,10 @@ class LieAlert:
         self.record_clip = bool(la.get("record_clip", True))
         self.record_dir = str(la.get("record_dir", "_debug_out/lie_clips"))
         self.record_fps = float(la.get("record_fps", 30.0))
+        # Duplicate-pad to wall clock made clips look like freeze→jump (one slow
+        # YOLO tick could write up to ~2.5s of identical frames). Off by default.
+        self.record_pad_wallclock = bool(la.get("record_pad_wallclock", False))
+        self.record_pad_max_frames = max(1, int(la.get("record_pad_max_frames", 2)))
         self.record_preroll_s = float(la.get("record_preroll_s", 2.0))
         self.record_postroll_s = float(la.get("record_postroll_s", 4.0))
         self.record_max_s = float(la.get("record_max_s", 120.0))
@@ -380,6 +384,13 @@ class LieAlert:
         self.record_clip = bool(la.get("record_clip", self.record_clip))
         self.record_dir = str(la.get("record_dir", self.record_dir))
         self.record_fps = float(la.get("record_fps", self.record_fps))
+        self.record_pad_wallclock = bool(
+            la.get("record_pad_wallclock", getattr(self, "record_pad_wallclock", False))
+        )
+        self.record_pad_max_frames = max(
+            1,
+            int(la.get("record_pad_max_frames", getattr(self, "record_pad_max_frames", 2))),
+        )
         self.record_preroll_s = float(la.get("record_preroll_s", self.record_preroll_s))
         self.record_postroll_s = float(
             la.get("record_postroll_s", self.record_postroll_s)
@@ -578,11 +589,15 @@ class LieAlert:
         logger.info(f"[LieAlert] recording clip → {path}")
 
     def _clip_write(
-        self, img_bgr, count_toward_max: bool = True, pad_wallclock: bool = True
+        self, img_bgr, count_toward_max: bool = True, pad_wallclock: bool | None = None
     ):
-        """Write one capture; when the bot loop is slower than record_fps, pad
-        duplicate frames so clip duration matches real elapsed time (middle of
-        the mini-game used to look cut because YOLO made the loop ~8–15fps)."""
+        """Write one capture frame.
+
+        Optional wall-clock pad (off by default): when the bot loop is slower
+        than record_fps, duplicate the previous frame a little so file duration
+        stays closer to real time. Heavy pad used to freeze 1–2s then jump,
+        which made clips look like unstable FPS (~85% near-dup on last take).
+        """
         wr = self._clip_writer
         if wr is None or img_bgr is None or getattr(img_bgr, "size", 0) == 0:
             return
@@ -594,16 +609,24 @@ class LieAlert:
         now = time.time()
         fps = max(5.0, float(self.record_fps))
         n_write = 1
-        if pad_wallclock and self._clip_last_write_t > 0:
+        do_pad = (
+            bool(self.record_pad_wallclock)
+            if pad_wallclock is None
+            else bool(pad_wallclock)
+        )
+        if do_pad and self._clip_last_write_t > 0:
             gap = now - float(self._clip_last_write_t)
-            # Round to how many 1/fps slots this gap covers (at least the new frame).
             n_write = max(1, int(round(gap * fps)))
-            # Cap one burst so a long stall cannot dump thousands of dupes.
-            n_write = min(n_write, int(fps * 2.5))
+            # Tiny cap only — never dump seconds of identical frames.
+            n_write = min(n_write, max(1, int(self.record_pad_max_frames)))
         try:
             for i in range(n_write):
                 # Hold the previous picture across the gap; last slot is fresh.
-                out = frame if (i == n_write - 1 or self._clip_last_frame is None) else self._clip_last_frame
+                out = (
+                    frame
+                    if (i == n_write - 1 or self._clip_last_frame is None)
+                    else self._clip_last_frame
+                )
                 wr.write(out)
                 self._clip_frames += 1
         except Exception as e:
@@ -622,6 +645,7 @@ class LieAlert:
             return
         path = self._clip_path
         n = self._clip_frames
+        started = float(getattr(self, "_clip_start_t", 0.0) or 0.0)
         self._clip_writer = None
         self._clip_path = None
         self._clip_size = None
@@ -637,7 +661,16 @@ class LieAlert:
         if path and n > 0 and os.path.exists(path):
             mb = os.path.getsize(path) / (1024 * 1024)
             why = f" ({reason})" if reason else ""
-            logger.info(f"[LieAlert] clip saved {path} frames={n} size={mb:.1f}MB{why}")
+            decl = max(5.0, float(self.record_fps))
+            play_s = n / decl
+            wall_s = (time.time() - started) if started > 0 else play_s
+            capt_fps = (n / wall_s) if wall_s > 0.05 else decl
+            logger.info(
+                f"[LieAlert] clip saved {path} frames={n} size={mb:.1f}MB "
+                f"play~{play_s:.1f}s@{decl:.0f}fps wall={wall_s:.1f}s "
+                f"capt~{capt_fps:.1f}fps pad={int(self.record_pad_wallclock)}"
+                f"{why}"
+            )
         elif path and os.path.exists(path) and n <= 0:
             try:
                 os.remove(path)
@@ -876,7 +909,17 @@ class LieAlert:
                     self.debug_pt = None
                     if now - float(getattr(self, "_intro_hold_log_t", 0.0) or 0.0) > 1.0:
                         self._intro_hold_log_t = now
-                        logger.info("[LieAlert] intro still up — hold mouse follow")
+                        left = max(
+                            0.0,
+                            float(getattr(self, "_intro_block_until", 0.0) or 0.0) - now,
+                        )
+                        logger.info(
+                            f"[LieAlert] intro still up — hold mouse follow "
+                            f"(block_left={left:.2f}s, "
+                            f"+{now - float(self._session_start_t):.1f}s)"
+                        )
+                elif self._user_driving_before_follow():
+                    pass
                 elif frame_count % self.follow_interval_frames == 0:
                     if not getattr(self, "_follow_started_logged", False):
                         self._follow_started_logged = True
@@ -1103,14 +1146,37 @@ class LieAlert:
                     return kw
         return ""
     def _should_block_follow_for_intro(self, img_bgr, now: float) -> bool:
-        """Block mouse-follow while countdown/instruction text is still visible."""
+        """Block mouse-follow while countdown/instruction text is still visible.
+
+        Hard cap from session start so OCR/template cannot stall follow for
+        seconds after follow_start_delay (last session armed at +3.8s).
+        Past follow_ready_t we never run OCR on this path — RapidOCR on a
+        large ROI blocks the capture thread and delays the first mouse snap.
+        """
+        session_t = float(getattr(self, "_session_start_t", 0.0) or 0.0)
+        delay = max(0.0, float(self.follow_start_delay_s))
+        # Absolute deadline: delay + small slack. Never hold past this.
+        intro_deadline = session_t + delay + 0.35 if session_t > 0 else 0.0
+        if intro_deadline > 0 and now >= intro_deadline:
+            self._intro_block_until = 0.0
+            return False
+
         if now < float(self._intro_block_until):
             return True
-        # Title-template intro gate
+
+        # Title-template intro gate (cheap). Cap extension inside deadline.
         if self._intro_dialog_still_up(img_bgr):
-            self._intro_block_until = now + 0.6
+            until = now + 0.45
+            if intro_deadline > 0:
+                until = min(until, intro_deadline)
+            self._intro_block_until = until
             return True
-        # OCR intro phrases (throttled)
+
+        # OCR only BEFORE follow_ready_t. After that the delay gate already
+        # waited out the countdown; blocking OCR here only adds latency.
+        ready_t = float(getattr(self, "_follow_ready_t", 0.0) or 0.0)
+        if ready_t > 0 and now >= ready_t:
+            return False
         if now - float(self._last_intro_check_t) < 0.45:
             return False
         self._last_intro_check_t = now
@@ -1133,7 +1199,10 @@ class LieAlert:
         blob = " ".join(str(item[1]) for item in result if len(item) >= 2)
         for kw in self.intro_ocr_block_keywords:
             if kw and kw in blob:
-                self._intro_block_until = now + 0.8
+                until = now + 0.5
+                if intro_deadline > 0:
+                    until = min(until, intro_deadline)
+                self._intro_block_until = until
                 logger.info(f"[LieAlert] intro UI still up ({kw}) — hold follow")
                 return True
         return False
@@ -3836,6 +3905,29 @@ class LieAlert:
         except Exception:
             return None
 
+    def _yield_to_user(self, reason: str):
+        self._mouse_yielded = True
+        self.following = False
+        logger.info(f"[LieAlert] {reason}")
+
+    def _user_driving_before_follow(self) -> bool:
+        """True if the user already moved the cursor during delay (before our first snap)."""
+        if self._mouse_yielded or self._mouse_placed_xy is not None:
+            return False
+        pos = self._cursor_pos()
+        watch = self._mouse_watch_xy
+        if pos is None or watch is None:
+            return False
+        thr = max(8.0, float(self.mouse_takeover_px))
+        dist = ((pos[0] - watch[0]) ** 2 + (pos[1] - watch[1]) ** 2) ** 0.5
+        if dist < thr:
+            return False
+        self._yield_to_user(
+            f"user already driving before follow "
+            f"(moved {dist:.0f}px from session cursor) — no auto snap"
+        )
+        return True
+
     def _watch_user_mouse(self):
         """
         Stop mouse-follow only when the *real* cursor is moved by the user.
@@ -3850,9 +3942,14 @@ class LieAlert:
         pos = self._cursor_pos()
         if pos is None:
             return
-        # Before we have moved the cursor ourselves, just track where it is.
+        # Before our first move: freeze the baseline once. Do NOT chase the
+        # cursor — otherwise manual play during delay hides the takeover and
+        # we still snap to the shape center seconds later.
         if self._mouse_placed_xy is None:
-            self._mouse_watch_xy = pos
+            if self._mouse_watch_xy is None:
+                self._mouse_watch_xy = pos
+            elif self._user_driving_before_follow():
+                return
             return
         # Only grace when the last move actually landed; otherwise stuck
         # detection must run even if we keep issuing SetCursorPos every frame.
@@ -3885,10 +3982,8 @@ class LieAlert:
                     self._warn_mouse_elevation_block()
                 return
         # Cursor left both commanded and pre-move positions → real user.
-        self._mouse_yielded = True
-        self.following = False
-        logger.info(
-            f"[LieAlert] user moved the mouse — stop auto-follow "
+        self._yield_to_user(
+            f"user moved the mouse — stop auto-follow "
             f"(dist={dist_cmd:.0f}px from commanded)"
         )
 
@@ -3986,6 +4081,10 @@ class LieAlert:
 
     def _move_mouse_to_frame_point(self, pt, capture):
         if self._mouse_yielded:
+            return
+        # Last check before the first snap — never yank the cursor off a
+        # player who already started the mini-game during our delay.
+        if self._mouse_placed_xy is None and self._user_driving_before_follow():
             return
         self._warn_mouse_elevation_block(capture)
         sx, sy = self._frame_to_screen(pt, capture)
