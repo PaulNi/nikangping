@@ -1,0 +1,395 @@
+bot:
+  mode: "hunt" # detect = 只检测不攻击, hunt
+  attack: "aoe_skill"  # 群攻（flash_patrol 下与怪无关）
+  map: "yun_cai_gong_yuan_v"  # 云彩公园 V（F2 中区巡逻；route 仍关）
+  enable_route: false  # 小地图左右尽头换向巡逻
+  flash_patrol: true          # 巡逻模式；F2 可开怪识别（左右怪数换向）
+  start_idle: true            # 启动后不自动打，等 F1/F2/F3
+
+system:
+  fps_limit_main: 30
+  fps_limit_window_capturor: 30
+
+key:
+  teleport: "z"               # 法师闪现
+  directional_attack: "x"
+  aoe_skill: "a"
+  add_hp: "end"
+  add_mp: "home"
+
+title:
+  enable: false               # flash_patrol 优先用名字牌，关掉称号锁偏
+  mode: "grayscale"
+  manual_select: true
+  max_candidates: 8
+  candidate_threshold: 0.30
+  lock_miss_tolerance: 18
+  manual_track_radius: 180
+  manual_track_threshold: 0.30
+  offset: [0, -60]
+  match_threshold: 0.24
+  cache_ttl: 30
+  prev_search_radius: 180
+  center_search_radius: 320
+  center_accept_radius: 220
+  max_jump_px: 220
+  stick_to_prev_margin: 0.01
+  strong_match_threshold: 0.06
+  white_lower: 185
+  white_upper: 255
+  blur_kernel: 3
+
+# ---------------------------------------------------------------------------
+# player nameplate localization (preferred) — 由 F1/F2 profile 覆盖
+# ---------------------------------------------------------------------------
+player_name:
+  enable: true
+  text: "甩锅侠12139"
+  template: "character/name.png"
+  match_threshold: 0.18
+  offset: [0, -55]
+  prev_search_radius: 240
+  full_search_interval: 10
+  ignore_bottom_ratio: 0.16
+  ignore_top_ratio: 0.08
+  max_jump_px: 280
+
+############################
+minimap:
+  x: 11
+  y: 152
+  width: 218
+  height: 95
+  # Classic yellow diamond (BGR). Keep cyan as fallback in code.
+  player_color: [0, 255, 255]
+  player_colors:
+    - [0, 255, 255]
+    - [0, 220, 255]
+    - [50, 220, 255]
+    - [136, 255, 255]
+  player_tolerance: 25
+  player_border_reject_px: 3
+  player_min_area: 3
+  player_max_area: 30
+  player_max_jump_px: 28
+
+monster_detect:
+  enable: false                   # flash_patrol 不靠怪识别；素材可留着
+  monsters: ["luster_pixie"]  # kept on disk; F2 does not load for patrol
+  mode: "grayscale"  # SQDIFF + alpha mask
+  diff_thres: 0.20
+  scales: [0.85, 1.0, 1.15]
+  strict_templates: true
+  max_matches_per_template: 20
+  display_scale: 0.47
+  detection_interval: 1
+  ignore_top_ratio: 0.22
+  max_dy_from_player: 200
+  bottom_floor_only: true         # only bottom-floor mobs
+  bottom_y_min_ratio: 0.50        # cy >= 50% client height
+  ignore_bottom_hud_ratio: 0.08   # drop chat HUD band
+  full_width_pad: 8               # F2 flash+detect 时几乎全屏搜怪
+  with_enemy_hp_bar: false
+  hp_bar_color: [0, 255, 0]
+  hp_bar_tolerance: 30
+
+directional_attack:
+  attack_in_place: false
+  search_enabled: true              # 左右尽头换向巡逻
+  search_trigger_frames: 1
+  aoe_monster_count: 1
+  engage_px: 200
+  chase_no_attack: false
+  chase_use_screen_center: false
+  in_place_walk_interval: 300
+  in_place_walk_frames: 4
+  in_place_stop_attack_frames: 8
+  in_place_walk_dir: "alternate"
+  search_attack_while_move: false   # 攻击由 flash_patrol 固定 action=aoe 触发
+  search_flip_frames: 0             # 0=禁用计时换向；只在小地图左右边缘转向
+  search_max_offset_px: 0
+  search_stall_frames: 0
+  search_stall_min_delta_px: 0
+  search_edge_px: 28                 # 小地图左右尽头多少像素内换向
+  search_wall_rehold_frames: 45      # 顶墙时多久才强制重按一次方向（太密会卡）
+  dir_reassert_interval_s: 1.0       # 巡逻方向键重按间隔；0.25 太密会卡
+  search_random_jump_chance: 0
+  search_random_jump_cd: 45
+
+route:
+  search_range: 40
+  auto_select_range: 80
+  climb_y_offset: 0.5
+  climb_y_interval: 5
+
+health_monitor:
+  enable: false
+  enable_hp: false
+  enable_mp: false
+  bar_count: 2
+  bar_white_thresh: 200
+  bar_min_aspect: 2.0
+  bar_max_aspect: 15.0
+  bar_min_area: 500
+  bar_max_area: 12000
+  bar_min_width: 110
+  bar_max_width: 180
+  bar_min_height: 16
+  bar_max_height: 24
+  add_hp_percent: 50
+  add_mp_percent: 10
+  hp_rearm_percent: 54
+  mp_rearm_percent: 12
+  hp_retry_timeout: 2.0
+  mp_retry_timeout: 1.5
+
+ui_coords:
+  ui_y_start: 610
+
+# ---------------------------------------------------------------------------
+# 挂机定时按键（默认=F1；F2 profile 会覆盖）
+# ---------------------------------------------------------------------------
+buff_skill:
+  keys: ["w", "shift", "end"]
+  cooldown: [120, 300, 1500]   # 2分钟 / 5分钟 / 25分钟（秒）
+  startup_delay: 1.5           # 启动后等3秒再开始加第一轮buff
+  action_cooldown: 1.5         # 两次buff键之间至少隔1.5秒
+  freeze_seconds: 2.0          # 每次按下后冻结移动/攻击（避免打断 buff）
+  press_duration: 0.12
+  special_press_duration: 0.28
+  wait_before_combat: true     # 初始buff全部加完后才开始闪现+攻击
+
+pickup:
+  enable: false
+  cooldown: 0.5
+
+# ---------------------------------------------------------------------------
+# AoE: 默认仅 A；F2 用 attack_combo: [s, a]
+# ---------------------------------------------------------------------------
+aoe_skill:
+  range_x: 400
+  range_y: 170
+  cooldown: 1.0
+  cooldown_min: 0.4             # 攻击随机间隔下限（秒）
+  cooldown_max: 0.6             # 攻击随机间隔上限（秒）
+  # attack_combo: []            # 空=只按 aoe_skill 键；F2 设为 [s, a]
+  # combo_gap: 0.15
+
+walk_teleport:
+  enable: true                  # 左右巡逻时用 Z 闪现
+  only_when_chasing: false      # flash_patrol：左右移动即闪现
+  cooldown: 8.0                 # 闪现基准间隔（秒）≈8s
+  cooldown_min: 7.5             # 闪现随机间隔下限
+  cooldown_max: 8.5             # 闪现随机间隔上限；每次按下后重抽
+
+# ---------------------------------------------------------------------------
+# 多角色 / 模式：启动空闲；F1 / F2 / F3 加载对应配置并开始（再按同键关闭）
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 测谎 / 谎言探测仪：
+#   - 检出后响铃并暂停挂机
+#   - auto_follow=true：倒计时后跟随「任意」渐隐移动图形（不限星形；不点击）
+# ---------------------------------------------------------------------------
+lie_alert:
+  enable: true
+  template: "assets/lie_detector/lie.png"
+  match_threshold: 0.14          # EN 标题；SQDIFF 越小越像（勿再放宽到 0.22）
+  cn_title_match_threshold: 0.030 # 中文标题必须几乎完美；手机裁图易误报
+  cn_title_require_ocr: true     # 中文标题命中后还要 OCR 确认，防误报
+  check_interval_frames: 8       # 开场说明窗只有约 3s，加快检出
+  alert_cooldown_s: 3.0
+  freeze_seconds: 8.0
+  hold_seconds: 35.0             # 整段小游戏跟完再放行 AFK
+  rearm_cooldown_s: 8.0          # 会话超时后冷却，避免立刻再误报循环
+  center_roi_ratio: 0.90
+  templates:
+    - "assets/lie_detector/lie_en.png"
+    # 开场白底说明窗（「3秒后，测谎小游戏开始」）——一出现就报警+录像
+    - "assets/lie_detector/lie_intro_banner.png"
+    - "assets/lie_detector/lie_intro_body.png"
+  intro_match_threshold: 0.025   # 说明窗模板；过松会把云层当弹窗
+    # 手机截的 lie_cn_title.png 分辨率不对，默认不启用
+    # - "assets/lie_detector/lie_cn_title.png"
+  ocr_enable: true
+  ocr_interval_frames: 15
+  ocr_keywords:
+    - "谎言探测仪"
+    - "谎言探测器"
+    - "测谎小游戏"
+    - "测谎仪"
+    - "3秒后"
+    - "请前往安全地点"
+    - "逐渐透明且移动"
+    - "LIE DETECTOR"
+    - "Lie Detector"
+  # —— 首锁白色图形 → 匀速光流/帧差续跟；绿色准星仅测试评分，不参与识别 ——
+  auto_follow: true
+  # 测谎触发自动录像（含触发前约 2s），结束后写入 _debug_out/lie_clips/
+  record_clip: true
+  record_dir: "_debug_out/lie_clips"
+  record_fps: 30
+  record_preroll_s: 1.5
+  record_preroll_fps: 10         # 挂机时预录采样；别跟截图同帧 copy，否则越挂越卡
+  record_postroll_s: 4.0         # 弹窗关闭后再多录几秒，避免收尾被掐
+  record_max_s: 120
+  record_draw_track: false       # true 时在录像上画红框，默认原画方便 YOLO
+  dialog_miss_limit: 5           # 连续漏检几次才结束会话（太小会中途掐录像）
+  dialog_min_session_s: 40.0     # 开局这么久内不因漏检提前结束（盖住白形+整段褪色）
+  mouse_takeover_px: 45          # 跟形滞后时手微移易误判；略放宽，真抢鼠仍会让出
+  # 倒计时约 3s；延迟太长会拖到白形已开始褪色才动手（上次 3.5s 刚好踩在白形消失点）
+  follow_start_delay_s: 1.8
+  follow_timeout_s: 90.0
+  follow_interval_frames: 1
+  shapes_dir: "assets/lie_detector/shapes"
+  # 同形框和中心。红框仍由白形粘滞 / 旋转 / 同路径排斥决定，不用模型分数当中心。
+  shape_peak_model: "assets/lie_detector/shape_peak.onnx"
+  # 白形褪色后的填充图案。只在白形消失后使用，多框时不拿最高分当中心。
+  fade_yolo_model: "assets/lie_detector/fade_filled.pt"
+  fade_yolo_conf: 0.20              # 褪色后提高 YOLO 召回（多框仍取最近中心）
+  fade_yolo_step_scale: 2.2         # YOLO 跟形步长相对 max_frame_step_px 的倍数
+  fade_yolo_hold_frames: 4          # YOLO 漏检时短暂停在上次框，少交给 flow/coast
+  fade_yolo_search_scale: 6.0       # 多框时相对当前中心的搜索半径（×max_frame_step_px）
+  acquire_min_score: 0.48
+  track_min_score: 0.28
+  template_min_score: 0.86
+  max_track_jump_px: 28
+  max_frame_step_px: 28
+  max_speed_px_s: 420
+  vel_smooth: 0.80
+  lock_search_radius: 64
+  shape_blob_min_area: 400
+  shape_blob_max_area: 32000
+  white_v_min: 175
+  white_s_max: 65
+  local_contrast_min: 22
+  exclude_top_ratio: 0.28
+  exclude_bottom_ratio: 0.18
+  exclude_side_ratio: 0.18
+  stale_lock_s: 1.6                 # 白形卡静态假高光时更快重锁
+  stale_lock_min_move_px: 4
+  stale_ban_s: 2.5
+  stale_ban_radius_px: 55
+  motion_weight: 0.35
+  template_weight: 0.50
+  mouse_smooth: 0.92                # 跟形更贴目标；大跳变代码里会硬吸
+  lose_target_grace_s: 2.0
+  # 只拦开场倒计时/提示；不要写「移动鼠标」——常驻说明「移动鼠标跟随…」会整场误拦跟形
+  intro_ocr_block_keywords:
+    - "2秒后"
+    - "3秒后"
+    - "1秒后"
+    - "测谎小游戏开始"
+    - "请前往安全地点"
+    - "放置在"
+
+
+profiles:
+  f1:
+    label: "甩锅侠12139"
+    player_name:
+      text: "甩锅侠12139"
+      template: "character/name.png"   # 或 character/name_12139.png
+    aoe_skill:
+      attack_combo: []                 # 只按 A
+      cooldown_min: 0.5               # 0.5–0.75s 攻击一次
+      cooldown_max: 0.75
+    walk_teleport:
+      enable: true                     # F1 保留 Z 闪现
+    bot:
+      flash_patrol: true               # 左右巡逻挂机
+    directional_attack:
+      station_hold: false
+      search_progress: minimap         # 小地图黄点 X 判断地图边缘
+      search_edge_ratio: 0.06          # 黄点真正到左/右约 6% 才换向（扫整张图）
+      search_edge_px: 10               # ratio 不可用时的像素兜底
+      search_edge_stall_frames: 20     # 仅在边缘带内卡住才顶墙换向
+      search_edge_stall_margin: 1.4    # 顶墙判定略宽于 edge_ratio，勿用 40% 中段
+      search_edge_stall_min_delta_px: 1.0
+      search_x_ema: 0.45               # 略跟手，减少滞后早掉头
+      search_left_ratio: null          # 不用 F2 中区比例，走全图边缘
+      search_right_ratio: null
+      search_mob_steer: false
+    monster_detect:
+      enable: false
+    buff_skill:
+      keys: ["w", "shift", "end"]
+      cooldown: [120, 300, 1500]       # 2分 / 5分 / 25分
+      wait_before_combat: true
+      freeze_seconds: 2.5             # F1 放 buff 时停住移动/攻击，避免打断
+      action_cooldown: 1.5
+    pet_feed:
+      enable: false
+  f2:
+    label: "甩锅侠12138"
+    player_name:
+      text: "甩锅侠12138"
+      template: "character/name_12138.png"
+    aoe_skill:
+      attack_combo: ["s", "a"]         # S=跳，0.1s 后 A=空中攻击
+      combo_gap: 0.1                   # 起跳后 0.1s 空中 A
+      cooldown_min: 0.8               # 每次跳跃间隔 0.8s
+      cooldown_max: 0.8
+    walk_teleport:
+      enable: false                    # 本任务不能闪现，取消 Z
+    bot:
+      flash_patrol: true
+    directional_attack:
+      station_hold: false
+      # 云彩公园：黄点 10%~80% 左右巡逻（右界收窄10%）；到边立刻强制掉头。不加怪物转向。
+      search_left_ratio: 0.10           # yellow left bound (~80% width span)
+      search_right_ratio: 0.80          # yellow right bound  # narrowed 10% from 0.90
+      search_edge_margin: 0.02          # force band acts like 0.12/0.88 (flip earlier)
+      search_edge_stall_frames: 10      # ~0.3s@30fps: no X progress near third -> flip
+      search_edge_stall_third: 0.40     # left/right third of minimap for stall flip
+      search_edge_stall_min_delta_px: 1.0
+      search_wall_rehold_frames: 45     # 顶墙重按降频，避免 F2 卡顿
+      search_stall_frames: 0            # disable mid-band stall thrash (edge-stall above)
+      search_stall_min_delta_px: 2.0
+      search_dir_sticky_frames: 90      # mid-band sticky; bound turns immediate
+      search_x_ema: 0.35                # smooth yellow X
+      search_bottom_y_min_ratio: 0.55   # yellow Y above this -> hold Down
+      search_mob_steer: false           # pre-monster: no L/R mob count steering
+      dir_reassert_interval_s: 1.0
+    monster_detect:
+      enable: false                    # F2 flash_patrol does not use monster detect
+    buff_skill:
+      keys: []                         # F2 不施放 buff
+      cooldown: []
+      wait_before_combat: false        # 开挂即巡逻攻击，不等 buff
+    # 养宠物：无施法动作，点按 END，不停顿移动/攻击
+    pet_feed:
+      enable: true
+      key: "end"
+      interval_s: 900                  # 15 分钟
+      startup_delay_s: 2.0             # 开 F2 后约 2s 先喂一次
+      press_duration: 0.08
+  f3:
+    label: "甩锅侠12139-通天塔定点"
+    player_name:
+      text: "甩锅侠12139"
+      template: "character/name.png"
+    aoe_skill:
+      attack_combo: []                 # 群攻键 = key.aoe_skill (A)
+      cooldown_min: 1.5
+      cooldown_max: 2.0
+    walk_teleport:
+      enable: false                    # 定点站桩，不闪现
+    bot:
+      flash_patrol: false              # 不用左右巡逻，走 station_hold
+    directional_attack:
+      station_hold: true               # 以开启瞬间小地图黄点为中心
+      station_deadzone_px: 6           # 偏离超过该像素才走回
+      search_left_ratio: null
+      search_right_ratio: null
+      search_mob_steer: false
+      search_bottom_y_min_ratio: null
+    monster_detect:
+      enable: false
+    buff_skill:
+      keys: ["w", "shift", "end"]      # 与 F1 一致
+      cooldown: [120, 300, 1500]
+      wait_before_combat: true
+      freeze_seconds: 2.5
+      action_cooldown: 1.5
+    pet_feed:
+      enable: false

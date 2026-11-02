@@ -1,0 +1,42 @@
+/MapleStoryAutoLevelUp-main/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+
+# Logs and screenshots
+log/
+screenshot/
+video/
+
+# Local debug dumps and editor backups
+_debug_out/
+*.bak
+*.bak_*
+
+# OS files
+.DS_Store
+Thumbs.db
+# Local / runtime
+.cursor/
+runs/
+demo_gif/
+*.mp4
+*.weights
+
+# Model backups / training dumps (keep runtime weights under assets/)
+**/fade_filled_pre_*.pt
+**/runs/
+tools/**/*.pt
+tools/**/*.onnx
