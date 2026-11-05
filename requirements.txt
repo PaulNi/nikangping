@@ -1,5 +1,5 @@
-# MapleStory Auto Detection �?Dependencies
-# Python 3.8+
+# MapleStory Auto Detection — Dependencies
+# Python 3.10–3.12 recommended
 
 # Computer vision
 opencv-python>=4.5.0
@@ -12,15 +12,24 @@ windows-capture
 # YAML configuration
 pyyaml>=5.4
 
-# Keyboard simulation (for future movement/attack control)
+# Keyboard simulation
 pyautogui>=0.9.53
 pynput>=1.7.0
 
-# Windows API (already installed with pywin32 typically)
+# Windows API
 pywin32>=300
 
-# Data validation (optional, for future use)
-# pydantic>=2.0
-
-# Optional: Chinese OCR fallback for lie-detector alert (detect only)
+# Lie-detector: OCR fallback + fade YOLO
 rapidocr-onnxruntime>=1.4.0
+ultralytics>=8.3.0
+onnxruntime>=1.16.0
+
+# ---------------------------------------------------------------------------
+# PyTorch
+# - CPU-only (default pip): works, but Fade YOLO is slow
+# - NVIDIA GPU (4070 etc.): install CUDA build INSTEAD, see requirements-cuda.txt
+#   or run: tools\setup_cuda_torch.bat
+# ---------------------------------------------------------------------------
+# torch / torchvision are intentionally NOT pinned here for CPU.
+# On GPU machines, install the CUDA wheel first (cu124), then:
+#   pip install -r requirements.txt

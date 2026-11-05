@@ -6,9 +6,15 @@ bot:
   flash_patrol: true          # 巡逻模式；F2 可开怪识别（左右怪数换向）
   start_idle: true            # 启动后不自动打，等 F1/F2/F3
 
+# 监视窗全图 copy+imshow 很吃 CPU；默认关掉。需要看预览时按 F10 开关，或 --enable_viz
+disable_viz: true
+
 system:
-  fps_limit_main: 30
-  fps_limit_window_capturor: 30
+  fps_limit_main: 25
+  fps_limit_window_capturor: 20      # 截图线程略降，给检测/跟形让 CPU
+  display_fps_limit: 8               # 监视窗口 imshow 上限
+  capturor_region_interval_s: 1.0    # 窗口矩形刷新间隔
+  hunt_log_every_n: 45               # Patrol/Hunt 日志降频
 
 key:
   teleport: "z"               # 法师闪现
@@ -48,8 +54,9 @@ player_name:
   template: "character/name.png"
   match_threshold: 0.18
   offset: [0, -55]
-  prev_search_radius: 240
-  full_search_interval: 10
+  prev_search_radius: 180
+  full_search_interval: 30           # 全图搜名降频；巡逻主要靠黄点
+  name_every_n: 3                    # 巡逻靠黄点；名字牌再降频
   ignore_bottom_ratio: 0.16
   ignore_top_ratio: 0.08
   max_jump_px: 280
@@ -60,6 +67,7 @@ minimap:
   y: 152
   width: 218
   height: 95
+  auto_detect_interval_s: 5.0    # 全图白边扫描很贵；有固定坐标就少扫
   # Classic yellow diamond (BGR). Keep cyan as fallback in code.
   player_color: [0, 255, 255]
   player_colors:
@@ -81,7 +89,8 @@ monster_detect:
   scales: [0.85, 1.0, 1.15]
   strict_templates: true
   max_matches_per_template: 20
-  display_scale: 0.47
+  display_scale: 0.30                # 监视窗口缩放；越小越不卡
+  display_every_n: 4                 # 每 N 个处理帧才画一次预览
   detection_interval: 1
   ignore_top_ratio: 0.22
   max_dy_from_player: 200
@@ -164,7 +173,7 @@ pickup:
   cooldown: 0.5
 
 # ---------------------------------------------------------------------------
-# AoE: 默认仅 A；F2 用 attack_style: jump_attack（空中跳打时序）
+# AoE: 默认仅 A；F2 用 attack_combo: [s, a]
 # ---------------------------------------------------------------------------
 aoe_skill:
   range_x: 400
@@ -196,10 +205,10 @@ lie_alert:
   match_threshold: 0.14          # EN 标题；SQDIFF 越小越像（勿再放宽到 0.22）
   cn_title_match_threshold: 0.030 # 中文标题必须几乎完美；手机裁图易误报
   cn_title_require_ocr: true     # 中文标题命中后还要 OCR 确认，防误报
-  check_interval_frames: 8       # 开场说明窗只有约 3s，加快检出
+  check_interval_frames: 4       # 模板便宜；OCR 另有墙钟门控
   alert_cooldown_s: 3.0
   freeze_seconds: 8.0
-  hold_seconds: 35.0             # 整段小游戏跟完再放行 AFK
+  hold_seconds: 50.0             # 跟形中会续期；避免卡顿后 35s 到点直接结束
   rearm_cooldown_s: 8.0          # 会话超时后冷却，避免立刻再误报循环
   center_roi_ratio: 0.90
   templates:
@@ -211,7 +220,10 @@ lie_alert:
     # 手机截的 lie_cn_title.png 分辨率不对，默认不启用
     # - "assets/lie_detector/lie_cn_title.png"
   ocr_enable: true
-  ocr_interval_frames: 15
+  # RapidOCR ~2s/次且已改异步；间隔仍拉大，避免后台线程抢 CPU
+  ocr_interval_frames: 120
+  ocr_min_interval_s: 5.0        # 异步提交最低间隔；跟形中不跑
+  ocr_during_follow: false
   ocr_keywords:
     - "谎言探测仪"
     - "谎言探测器"
@@ -224,24 +236,23 @@ lie_alert:
     - "Lie Detector"
   # —— 首锁白色图形 → 匀速光流/帧差续跟；绿色准星仅测试评分，不参与识别 ——
   auto_follow: true
-  # 测谎触发自动录像（含触发前约 2s），结束后写入 _debug_out/lie_clips/
-  record_clip: true
+  # 自动录像会拖垮跟形（上次墙钟 46s 只写出 56 帧 ≈1.2fps，鼠标吸中后几乎不动）。
+  # 需要素材时再临时改 true。
+  record_clip: false
   record_dir: "_debug_out/lie_clips"
   record_fps: 30
-  # YOLO 跟形时主循环常掉到 ~8–15fps；旧逻辑按墙钟补重复帧，一次最多垫 ~2.5s
-  # 静帧，回看就像帧率崩了（上次素材近 85% 近重复）。默认不补，一帧采集写一帧。
   record_pad_wallclock: false
-  record_pad_max_frames: 2       # 若开启补帧，单次最多重复几帧
-  record_preroll_s: 1.5
-  record_preroll_fps: 10         # 挂机时预录采样；别跟截图同帧 copy，否则越挂越卡
-  record_postroll_s: 4.0         # 弹窗关闭后再多录几秒，避免收尾被掐
+  record_pad_max_frames: 2
+  record_preroll_s: 0              # 预录关闭（即便开启 record_clip 也不预拷）
+  record_preroll_fps: 5
+  record_postroll_s: 0
   record_max_s: 120
-  record_draw_track: false       # true 时在录像上画红框，默认原画方便 YOLO
+  record_draw_track: false
   dialog_miss_limit: 5           # 连续漏检几次才结束会话（太小会中途掐录像）
   dialog_min_session_s: 40.0     # 开局这么久内不因漏检提前结束（盖住白形+整段褪色）
-  mouse_takeover_px: 45          # 跟形滞后时手微移易误判；略放宽，真抢鼠仍会让出
-  # 倒计时约 3s；延迟太长会拖到白形已开始褪色才动手（上次 3.5s 刚好踩在白形消失点）
-  follow_start_delay_s: 1.8
+  mouse_takeover_px: 55          # 仅在首次吸鼠之后判定抢鼠；倒计时微移不再永久放弃
+  # 倒计时约 3s；检到说明窗才等这段。OCR 检晚且说明窗已消失则 delay=0 立刻吸鼠
+  follow_start_delay_s: 1.0
   follow_timeout_s: 90.0
   follow_interval_frames: 1
   shapes_dir: "assets/lie_detector/shapes"
@@ -249,6 +260,7 @@ lie_alert:
   shape_peak_model: "assets/lie_detector/shape_peak.onnx"
   # 白形褪色后的填充图案。只在白形消失后使用，多框时不拿最高分当中心。
   fade_yolo_model: "assets/lie_detector/fade_filled.pt"
+  fade_yolo_device: auto              # auto=有 CUDA 用显卡；可强制 cpu / cuda:0
   fade_yolo_conf: 0.20              # 褪色后提高 YOLO 召回（多框仍取最近中心）
   fade_yolo_step_scale: 2.2         # YOLO 跟形步长相对 max_frame_step_px 的倍数
   fade_yolo_hold_frames: 4          # YOLO 漏检时短暂停在上次框，少交给 flow/coast
@@ -329,43 +341,42 @@ profiles:
       text: "甩锅侠12138"
       template: "character/name_12138.png"
     aoe_skill:
-      # 空中跳打时序：按住 S → 空中延迟 → 按住 A → 松 S → 间隙 → 松 A
-      attack_style: jump_attack
-      attack_combo: ["s", "a"]
-      jump_key: "s"
-      skill_key: "a"
-      jump_air_delay: 0.08             # 起跳后到按 A
-      skill_hold: 0.12                 # 空中按住 A
-      skill_release_gap: 0.12          # 松跳后到松 A
-      jump_interval_min: 0.35          # 轮次间隔
-      jump_interval_max: 0.50
-      cooldown_min: 0.35
-      cooldown_max: 0.50
+      attack_combo: ["s", "a"]         # S=跳，0.1s 后 A=空中攻击；每轮都是 S→A
+      combo_gap: 0.1                   # 起跳后 0.1s 空中 A
+      cooldown_min: 0.8               # 固定 0.8s 一轮
+      cooldown_max: 0.8
     walk_teleport:
       enable: false                    # 本任务不能闪现，取消 Z
     bot:
       flash_patrol: true
     directional_attack:
       station_hold: false
-      # 云彩公园：黄点中区巡逻；跳打容易冲墙，软界+提前量+贴墙卡滞一起收紧。
-      search_left_ratio: 0.12           # yellow left soft bound
-      search_right_ratio: 0.75          # yellow right soft bound
-      search_edge_margin: 0.06          # force ≈ 0.18 / 0.69
-      search_approach_margin: 0.05      # 仍朝该墙走时再提前 ~5% 掉头（防跳打过冲）
-      search_flip_attack_pause_s: 0.28  # 掉头后先走路，暂停跳打一瞬
-      search_wall_screen_agree: true    # 名字牌也贴同侧屏边时补强强制掉头
+      # 云彩公园：黄点 10%~90% 巡逻。黄点常卡中区再跳到物理边，需提前量+屏边+卡滞。
+      search_left_ratio: 0.10           # yellow left soft bound
+      search_right_ratio: 0.90          # yellow right soft bound（+10%）
+      # 中区来回 10 次后，下一段扫整张小地图；扫完一轮再回 10%~90%
+      search_full_map_every_round_trips: 10
+      search_full_map_left_ratio: 0.0
+      search_full_map_right_ratio: 1.0
+      search_full_map_legs: 2           # 全图模式走几个单向（2=一来回）
+      search_edge_margin: 0.04          # force ≈ 0.14 / 0.76
+      search_approach_margin: 0.04      # 仍朝该边走时略提前掉头（勿过大）
+      search_flip_attack_pause_s: 0.22  # 掉头后短暂停跳打，先走离边
+      search_flip_min_frames: 18        # 非硬边界最少隔这么多帧才再掉头（防左右抽）
+      search_wall_dir_screen: true      # 仅当黄点也在同侧才信屏边（防名字牌卡右）
+      search_wall_screen_agree: true
       search_wall_screen_ratio: 0.88
-      search_edge_stall_frames: 6       # ~0.2s@30fps: 近界无位移 -> 掉头
-      search_edge_stall_third: 0.50
-      search_edge_stall_bound_band: 0.10 # 软界内侧 10% 也算近界
-      search_edge_stall_min_delta_px: 0.8
-      search_wall_rehold_frames: 30     # 贴墙时更勤重按反向键
-      search_stall_frames: 0            # disable mid-band stall thrash (edge-stall above)
+      search_edge_stall_frames: 18      # 只在软边界附近卡住才掉头
+      search_edge_stall_third: 0.22     # 勿用 0.45：会把半张小地图当边缘
+      search_edge_stall_bound_band: 0.08
+      search_edge_stall_min_delta_px: 1.0
+      search_wall_rehold_frames: 30
+      search_stall_frames: 0
       search_stall_min_delta_px: 2.0
-      search_dir_sticky_frames: 90      # mid-band sticky; bound turns immediate
-      search_x_ema: 0.35                # smooth yellow X
-      search_bottom_y_min_ratio: 0.55   # yellow Y above this -> hold Down
-      search_mob_steer: false           # pre-monster: no L/R mob count steering
+      search_dir_sticky_frames: 90      # mid-band sticky; hard yellow immediate
+      search_x_ema: 0.35
+      search_bottom_y_min_ratio: 0.55
+      search_mob_steer: false
       dir_reassert_interval_s: 1.0
     monster_detect:
       enable: false                    # F2 flash_patrol does not use monster detect

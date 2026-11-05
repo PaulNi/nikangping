@@ -282,6 +282,11 @@ class KeyBoardController:
                 self._detector.reload_player_name()
             except Exception as e:
                 logger.warning(f"[KB] reload_player_name failed: {e}")
+        if self._detector is not None and hasattr(self._detector, "reset_patrol_cycle"):
+            try:
+                self._detector.reset_patrol_cycle()
+            except Exception:
+                pass
 
         # Reload monster templates only when this profile enables detect.
         # F2 pre-monster: enable=false — skip luster_pixie load (assets stay on disk).

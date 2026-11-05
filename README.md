@@ -62,15 +62,15 @@
 **定位**：名字牌 `character/name_12138.png`（甩锅侠12138）
 
 **挂机逻辑**
-- `flash_patrol`：左右巡逻，小地图黄点约 **12%～75%** 中区来回（提前强制掉头，防跳打贴墙）
+- `flash_patrol`：左右巡逻，小地图黄点 **约 10%～90%** 中区来回；每 **10 次往返**后下一段扫 **全图 0%～100%**，再回到中区
 - 黄点 Y 偏高（平台）时按住 `↓`
 - **不开 Z**（本图不能闪现）
 - **不开**怪物识别 / 怪物转向
 - **不加战斗 Buff**，开挂即打
 
-**攻击**（`attack_style: jump_attack`）
-- 按住 `S` → ~0.08s → 按住 `A` → 松 `S` → ~0.12s → 松 `A`
-- 轮次间隔约 **0.35～0.50s**
+**攻击**
+- 连招 `S` → 0.1s → `A`（每轮都是 S→A）
+- 每轮间隔 **固定 0.8s**
 
 **养宠物**（无施法动作，**不停顿**）
 | 键 | 间隔 |
@@ -100,11 +100,49 @@
 | | F1 | F2 | F3 |
 |--|----|----|-----|
 | 角色 | 12139 | 12138 | 12139 |
-| 移动 | 全图边缘巡逻 | 中区 12%～75% | 定点站桩 |
-| 攻击 | `A` 0.5–0.75s | 空中跳打 `S`→`A` | `A` 1.5–2.0s |
+| 移动 | 全图边缘巡逻 | 中区 10%～90%（每 10 往返全图一次） | 定点站桩 |
+| 攻击 | `A` 0.5–0.75s | `S`+`A` 0.8s | `A` 1.5–2.0s |
 | `Z` 闪现 | 开 | 关 | 关 |
 | Buff | W/Shift/End | 无 | W/Shift/End |
 | 养宠物 | 无 | End 每 15 分 | 无 |
+
+# 环境依赖（含 CUDA 测谎 YOLO）
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+**有 NVIDIA 显卡（如 RTX 4070）时**，先装 CUDA 版 PyTorch，再装项目依赖：
+
+```powershell
+.\tools\setup_cuda_torch.bat
+```
+
+或手动：
+
+```powershell
+pip uninstall -y torch torchvision torchaudio
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
+
+验证：
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+启动后日志应出现：`[LieAlert] YOLO device=cuda:0 (...)`。配置项 `lie_alert.fade_yolo_device: auto`（可强制 `cpu` / `cuda:0`）。
+
+离线测谎闸门（改代码后先跑这个再上号）：
+
+```powershell
+.\.venv\Scripts\python.exe tools\test_lie_follow_video.py --no-preview --video _debug_out\bilibili\BV1UWHz61ETm_game.mp4 --out _debug_out\lie_gate.mp4
+```
+
+看结尾 `VERDICT PASS/FAIL`。
 
 # 1、识别角色 + 怪物 + miniMap
 ## 1-1、演示

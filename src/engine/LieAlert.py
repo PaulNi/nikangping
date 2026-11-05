@@ -59,8 +59,13 @@ class LieAlert:
         self.cn_title_require_ocr = bool(la.get("cn_title_require_ocr", True))
         self.ocr_enable = bool(la.get("ocr_enable", True))
         self.ocr_interval_frames = max(
-            self.check_interval_frames, int(la.get("ocr_interval_frames", 30))
+            self.check_interval_frames, int(la.get("ocr_interval_frames", 90))
         )
+        # RapidOCR is ~2s/call on 1366x768 — NEVER run it on every template miss.
+        # Wall-clock gate keeps AFK loop ~20fps; templates catch intro banner.
+        self.ocr_min_interval_s = float(la.get("ocr_min_interval_s", 2.5))
+        self.ocr_during_follow = bool(la.get("ocr_during_follow", False))
+        self._last_ocr_t = 0.0
         kws = la.get("ocr_keywords") or [
             "测谎",
             "测谎仪",
@@ -176,6 +181,13 @@ class LieAlert:
         self._ocr = None
         self._ocr_init_tried = False
         self._ocr_fail_logged = False
+        self._ocr_lock = threading.Lock()
+        self._ocr_busy = False
+        self._pending_ocr_hit = ""
+        self._ocr_submit_t = 0.0
+        self._model_load_lock = threading.Lock()
+        self._track_models_warming = False
+        self._follow_tick_t = 0.0
 
         self._session_start_t = 0.0
         self._follow_ready_t = 0.0
@@ -255,8 +267,11 @@ class LieAlert:
         self.fade_yolo_step_scale = float(la.get("fade_yolo_step_scale", 2.2))
         self.fade_yolo_hold_frames = max(0, int(la.get("fade_yolo_hold_frames", 4)))
         self.fade_yolo_search_scale = float(la.get("fade_yolo_search_scale", 6.0))
+        # auto | cpu | cuda | cuda:0 …
+        self.fade_yolo_device = str(la.get("fade_yolo_device", "auto") or "auto").strip()
         self._fade_yolo = None
         self._fade_yolo_failed = False
+        self._fade_yolo_device_resolved = None
         self._yolo_hold = 0
         # All same-shape instances (target + decoys) for motion-outlier pick
         self._all_shape_prev = []  # [(cx,cy,ang), ...]
@@ -303,12 +318,19 @@ class LieAlert:
         self._preroll = []  # recent BGR frames before trigger
         self._preroll_last_t = 0.0
         pre_fps = max(4.0, min(float(self.record_fps), float(self.record_preroll_fps)))
-        self._preroll_max = max(1, int(round(pre_fps * self.record_preroll_s)))
+        if float(self.record_preroll_s) <= 0:
+            self._preroll_max = 0
+        else:
+            self._preroll_max = max(1, int(round(pre_fps * self.record_preroll_s)))
 
         self._load_templates()
         self._load_shape_templates()
-        if self.ocr_enable:
-            self._ensure_ocr()
+        # Do NOT warm RapidOCR here — loading + first infer stalls startup and
+        # idle AFK. It loads lazily on the rare OCR fallback path.
+        # Preload peak/YOLO off-thread so the first lie session does not freeze
+        # the main loop (~28s YOLO load on 2026-11-05 00:17).
+        if self.enable and self.auto_follow:
+            self._warm_track_models_async()
 
     def reload_cfg(self, cfg: dict):
         """Refresh settings after profile switch (paths usually stay global)."""
@@ -339,6 +361,12 @@ class LieAlert:
         self.ocr_interval_frames = max(
             self.check_interval_frames,
             int(la.get("ocr_interval_frames", self.ocr_interval_frames)),
+        )
+        self.ocr_min_interval_s = float(
+            la.get("ocr_min_interval_s", getattr(self, "ocr_min_interval_s", 2.5))
+        )
+        self.ocr_during_follow = bool(
+            la.get("ocr_during_follow", getattr(self, "ocr_during_follow", False))
         )
         kws = la.get("ocr_keywords") or self.ocr_keywords
         if isinstance(kws, str):
@@ -379,8 +407,6 @@ class LieAlert:
             self.extra_templates = new_extras
             self._tmpl_missing_logged = False
             self._load_templates()
-        if self.ocr_enable and self._ocr is None:
-            self._ensure_ocr()
         self.record_clip = bool(la.get("record_clip", self.record_clip))
         self.record_dir = str(la.get("record_dir", self.record_dir))
         self.record_fps = float(la.get("record_fps", self.record_fps))
@@ -413,6 +439,10 @@ class LieAlert:
         self.fade_yolo_search_scale = float(
             la.get("fade_yolo_search_scale", self.fade_yolo_search_scale)
         )
+        self.fade_yolo_device = str(
+            la.get("fade_yolo_device", getattr(self, "fade_yolo_device", "auto"))
+            or "auto"
+        ).strip()
         self.dialog_miss_limit = max(
             2, int(la.get("dialog_miss_limit", self.dialog_miss_limit))
         )
@@ -420,7 +450,11 @@ class LieAlert:
             la.get("dialog_min_session_s", self.dialog_min_session_s)
         )
         pre_fps = max(4.0, min(float(self.record_fps), float(self.record_preroll_fps)))
-        self._preroll_max = max(1, int(round(pre_fps * self.record_preroll_s)))
+        if float(self.record_preroll_s) <= 0:
+            self._preroll_max = 0
+            self._preroll = []
+        else:
+            self._preroll_max = max(1, int(round(pre_fps * self.record_preroll_s)))
 
     def _all_template_paths(self):
         paths = [self.template_path] + list(self.extra_templates)
@@ -523,8 +557,58 @@ class LieAlert:
                 )
                 self._ocr_fail_logged = True
 
+    def _submit_ocr_async(self, img_bgr, reason: str = ""):
+        """Run RapidOCR off the detect thread — it is ~2s and must not block AFK/follow."""
+        if not self.ocr_enable:
+            return
+        now = time.time()
+        if (now - float(getattr(self, "_ocr_submit_t", 0.0) or 0.0)) < max(
+            0.5, float(getattr(self, "ocr_min_interval_s", 2.5) or 2.5)
+        ):
+            return
+        with self._ocr_lock:
+            if self._ocr_busy:
+                return
+            self._ocr_busy = True
+            self._ocr_submit_t = now
+            self._last_ocr_t = now
+        try:
+            frame = img_bgr.copy()
+        except Exception:
+            with self._ocr_lock:
+                self._ocr_busy = False
+            return
+
+        def _worker():
+            hit = ""
+            try:
+                self._ensure_ocr()
+                if self._ocr is not None:
+                    hit = self._match_ocr(frame) or ""
+            except Exception as e:
+                logger.debug(f"[LieAlert] async OCR error: {e}")
+            finally:
+                with self._ocr_lock:
+                    if hit:
+                        self._pending_ocr_hit = hit
+                        logger.info(
+                            f"[LieAlert] async OCR hit={hit}"
+                            + (f" ({reason})" if reason else "")
+                        )
+                    self._ocr_busy = False
+
+        threading.Thread(target=_worker, daemon=True, name="LieOCR").start()
+
+    def _consume_pending_ocr(self) -> str:
+        with self._ocr_lock:
+            hit = str(getattr(self, "_pending_ocr_hit", "") or "")
+            self._pending_ocr_hit = ""
+            return hit
+
     def _preroll_push(self, img_bgr):
         if not self.record_clip or img_bgr is None or getattr(img_bgr, "size", 0) == 0:
+            return
+        if float(self.record_preroll_s) <= 0 or int(self._preroll_max) <= 0:
             return
         # Idle AFK path: copying a full BGR every detector tick causes memory
         # churn and capture FPS collapse after tens of minutes. Sample at
@@ -708,25 +792,36 @@ class LieAlert:
         # Detection only on cadence — NOT every frame while visible (that caused
         # false-positive spam re-arming hold forever). Follow still runs below.
         do_detect = frame_count % self.check_interval_frames == 0
-        # While already in a hold, occasionally reconfirm via OCR only
-        do_ocr_reconfirm = self.visible and (
-            frame_count % self.ocr_interval_frames == 0
+        ocr_due = (now - float(getattr(self, "_last_ocr_t", 0.0) or 0.0)) >= max(
+            0.5, float(getattr(self, "ocr_min_interval_s", 2.5) or 2.5)
+        )
+        # Sticky reconfirm: templates preferred; OCR only on rare wall-clock ticks
+        # and never while actively following (OCR ~2s freezes mouse track).
+        do_ocr_reconfirm = (
+            self.visible
+            and not self.following
+            and ocr_due
+            and (frame_count % self.ocr_interval_frames == 0)
         )
 
         found = False
         hit = ""
+        # Async OCR result from a previous tick (never blocks this frame).
+        pending_ocr = self._consume_pending_ocr() if self.ocr_enable else ""
         if do_detect and now >= float(self._rearm_after_t):
             tmpl_found, tmpl_hit, tmpl_is_cn = self._match_templates(img_frame_bgr)
-            ocr_hit = ""
-            need_ocr = self.ocr_enable and (
-                (not tmpl_found)
-                or (tmpl_is_cn and self.cn_title_require_ocr)
+            ocr_hit = pending_ocr
+            pending_ocr = ""
+            # OCR is async + rare. Template miss used to sync-call RapidOCR every
+            # check_interval and froze the bot at ~2–3 fps (log gaps 4–5s).
+            need_ocr = self.ocr_enable and ocr_due and (
+                (tmpl_is_cn and self.cn_title_require_ocr and tmpl_found)
+                or (not tmpl_found and not self.visible)
                 or do_ocr_reconfirm
             )
             if need_ocr:
-                self._ensure_ocr()
-                if self._ocr is not None:
-                    ocr_hit = self._match_ocr(img_frame_bgr) or ""
+                why = "cn_confirm" if (tmpl_is_cn and tmpl_found) else "fallback"
+                self._submit_ocr_async(img_frame_bgr, reason=why)
 
             if tmpl_found and tmpl_is_cn and self.cn_title_require_ocr:
                 # Phone-crop CN title alone is a known false-positive source
@@ -734,9 +829,10 @@ class LieAlert:
                     found = True
                     hit = f"{tmpl_hit}+ocr:{ocr_hit}"
                 else:
+                    # Kick async confirm; accept on a later tick when OCR returns.
                     logger.debug(
                         f"[LieAlert] ignore weak CN title hit {tmpl_hit} "
-                        f"score={self._last_score:.3f} (no OCR confirm)"
+                        f"score={self._last_score:.3f} (await OCR confirm)"
                     )
             elif tmpl_found:
                 found = True
@@ -746,62 +842,23 @@ class LieAlert:
                 hit = f"ocr:{ocr_hit}"
 
             if found:
-                self._last_hit = hit
-                self._hold_until = now + max(1.0, self.hold_seconds)
-                self._dialog_miss = 0
-                if not self._was_visible:
-                    self._session_start_t = now
-                    self._track_xy = None
-                    self._track_vel = (0.0, 0.0)
-                    self._mouse_xy = None
-                    self._mouse_placed_xy = None
-                    self._mouse_watch_xy = None
-                    self._mouse_last_move_t = 0.0
-                    self._mouse_last_move_ok = False
-                    self._mouse_elev_warned = False
-                    self._mouse_yielded = False
-                    self._prev_gray = None
-                    self._last_shape_name = ""
-                    self._timeout_logged = False
-                    self._locked = False
-                    self._lock_anchor_xy = None
-                    self._lock_moved_t = 0.0
-                    self._stale_ban_xy = None
-                    self._stale_ban_until = 0.0
-                    self._follow_started_logged = False
-                    self._delay_hold_log_t = 0.0
-                    self._intro_hold_log_t = 0.0
-                    # Hard gate: never follow during delay (intro icons are static whites)
-                    delay = max(0.0, self.follow_start_delay_s)
-                    self._follow_ready_t = now + delay
-                    # Only a short OCR intro latch — do NOT pin intro_block to the
-                    # full delay (that duplicated the gate and bad keywords could
-                    # keep extending it through the whole mini-game).
-                    self._intro_block_until = now + min(delay, 1.2)
-                    self._reset_bg_model()
-                    self._clip_start(img_frame_bgr)
-                    logger.info(
-                        f"[LieAlert] session start — follow in "
-                        f"{delay:.1f}s "
-                        f"(auto_follow={self.auto_follow}, "
-                        f"shapes={len(self._shape_list)}, bg_sub={self.use_bg_subtractor})"
-                    )
+                self._on_dialog_found(img_frame_bgr, hit, now)
             elif self.visible:
                 # Detect tick with no dialog confirm → count toward ending sticky
                 self._dialog_miss += 1
-        elif do_ocr_reconfirm and now >= float(self._rearm_after_t) and self.ocr_enable:
-            # Soft reconfirm during sticky hold without template every frame
-            self._ensure_ocr()
-            if self._ocr is not None:
-                ocr_hit = self._match_ocr(img_frame_bgr)
-                if ocr_hit:
-                    found = True
-                    hit = f"ocr:{ocr_hit}"
-                    self._last_hit = hit
-                    self._hold_until = now + max(1.0, self.hold_seconds)
-                    self._dialog_miss = 0
-                elif self.visible:
-                    self._dialog_miss += 1
+        elif pending_ocr and now >= float(self._rearm_after_t):
+            # OCR finished in background while we were not on a detect tick.
+            found = True
+            hit = f"ocr:{pending_ocr}"
+            self._on_dialog_found(img_frame_bgr, hit, now)
+        elif (
+            do_ocr_reconfirm
+            and now >= float(self._rearm_after_t)
+            and self.ocr_enable
+            and not self.following
+        ):
+            # Soft reconfirm during sticky hold — async; never during mouse follow.
+            self._submit_ocr_async(img_frame_bgr, reason="reconfirm")
 
         sticky = now < float(self._hold_until)
         session_age = (
@@ -895,8 +952,8 @@ class LieAlert:
             ):
                 self._learn_background(img_frame_bgr, locked=False)
 
-            # Mouse follow mini-game. A real cursor move by the user ends it
-            # for this dialog; AFK stays paused until the dialog is gone.
+            # Mouse follow mini-game. Real takeover only counts AFTER our first
+            # snap — bumps during the intro delay must not abort AFK follow.
             if self.auto_follow:
                 self._watch_user_mouse()
             if self._mouse_yielded:
@@ -918,8 +975,6 @@ class LieAlert:
                             f"(block_left={left:.2f}s, "
                             f"+{now - float(self._session_start_t):.1f}s)"
                         )
-                elif self._user_driving_before_follow():
-                    pass
                 elif frame_count % self.follow_interval_frames == 0:
                     if not getattr(self, "_follow_started_logged", False):
                         self._follow_started_logged = True
@@ -1027,8 +1082,115 @@ class LieAlert:
         y0, y1 = int(fh * 0.18), int(fh * 0.58)
         x0, x1 = int(fw * 0.28), int(fw * 0.72)
         return gray[y0:y1, x0:x1], (x0, y0)
+
+    def _intro_panel_visible(self, img_bgr) -> bool:
+        """True while the white intro instruction panel (banner/body) is on screen."""
+        if img_bgr is None or not self._tmpl_list:
+            return False
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        fh, fw = gray.shape[:2]
+        band, _ = self._dialog_band(gray)
+        for path, tmpl in self._tmpl_list:
+            if not self._is_intro_template(path):
+                continue
+            th, tw = tmpl.shape[:2]
+            if tw >= fw or th >= fh:
+                continue
+            search = band
+            if search.shape[0] <= th or search.shape[1] <= tw:
+                search = gray
+            try:
+                res = cv2.matchTemplate(search, tmpl, cv2.TM_SQDIFF_NORMED)
+                min_val = float(np.nanmin(res))
+            except Exception:
+                continue
+            if np.isfinite(min_val) and min_val <= self._threshold_for_template(path):
+                return True
+        return False
+
+    def _on_dialog_found(self, img_frame_bgr, hit: str, now: float):
+        """Apply sticky hold + one-shot session init when dialog is first seen."""
+        self._last_hit = hit
+        self._hold_until = now + max(1.0, self.hold_seconds)
+        self._dialog_miss = 0
+        if self._was_visible:
+            return
+        self._session_start_t = now
+        self._track_xy = None
+        self._track_vel = (0.0, 0.0)
+        self._mouse_xy = None
+        self._mouse_placed_xy = None
+        self._mouse_watch_xy = None
+        self._mouse_last_move_t = 0.0
+        self._mouse_last_move_ok = False
+        self._mouse_elev_warned = False
+        self._mouse_yielded = False
+        self._prev_gray = None
+        self._last_shape_name = ""
+        self._timeout_logged = False
+        self._locked = False
+        self._lock_anchor_xy = None
+        self._lock_moved_t = 0.0
+        self._stale_ban_xy = None
+        self._stale_ban_until = 0.0
+        self._follow_started_logged = False
+        self._delay_hold_log_t = 0.0
+        self._intro_hold_log_t = 0.0
+        # Intro still up → wait out countdown. Late OCR (title only,
+        # panel already gone) → arm immediately so we do not sit idle
+        # after the game countdown already finished.
+        delay = self._compute_session_follow_delay(img_frame_bgr, hit)
+        self._follow_ready_t = now + delay
+        # Only a short OCR intro latch — do NOT pin intro_block to the
+        # full delay (bad keywords could keep extending through the game).
+        self._intro_block_until = (
+            now + min(delay, 1.0) if delay > 0 else 0.0
+        )
+        self._reset_bg_model()
+        self._clip_start(img_frame_bgr)
+        # Warm heavy models off the follow hot path.
+        self._warm_track_models_async()
+        logger.info(
+            f"[LieAlert] session start — follow in "
+            f"{delay:.1f}s hit={hit} "
+            f"(auto_follow={self.auto_follow}, "
+            f"shapes={len(self._shape_list)}, bg_sub={self.use_bg_subtractor}, "
+            f"record={int(self.record_clip)})"
+        )
+
+    def _compute_session_follow_delay(self, img_bgr, hit: str) -> float:
+        """
+        How long to wait before first mouse snap.
+
+        Early hit (intro banner / 「3秒后」): use configured delay.
+        Late hit (OCR title after panel already gone): 0 — countdown already
+        over from the player's view; waiting again leaves the cursor idle.
+        """
+        base = max(0.0, float(self.follow_start_delay_s))
+        hit_s = str(hit or "")
+        hit_l = hit_s.lower()
+        early_markers = (
+            "intro_banner",
+            "intro_body",
+            "3秒后",
+            "2秒后",
+            "请前往安全",
+        )
+        if any(m.lower() in hit_l if m.isascii() else m in hit_s for m in early_markers):
+            return base
+        if self._intro_panel_visible(img_bgr):
+            # Detected via title OCR while panel still up — short wait only.
+            return min(base, 0.7)
+        logger.info(
+            "[LieAlert] intro panel already gone at detect — arm follow now "
+            f"(hit={hit_s})"
+        )
+        return 0.0
+
     def _intro_dialog_still_up(self, img_bgr) -> bool:
-        """True while 谎言探测仪 title chrome is still a strong match (countdown UI)."""
+        """True while countdown/intro chrome is still a strong match."""
+        if self._intro_panel_visible(img_bgr):
+            return True
         if not self._tmpl_list:
             return False
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -1053,7 +1215,10 @@ class LieAlert:
         return False
 
     def _match_templates(self, img_bgr):
-        """Return (found, hit_str, is_cn_title)."""
+        """Return (found, hit_str, is_cn_title).
+
+        Cheap title templates first; large intro banner/body only if those miss.
+        """
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         fh, fw = gray.shape[:2]
         roi, _ = self._center_roi(gray)
@@ -1061,31 +1226,40 @@ class LieAlert:
         best_pass_score = 1.0
         best_pass_path = ""
         best_any_score = 1.0
-        for path, tmpl in self._tmpl_list:
-            th, tw = tmpl.shape[:2]
-            if tw >= fw or th >= fh:
-                continue
-            # Intro 说明窗: only search the mid dialog band with a tight score
-            # so sky/cloud patches cannot trip the alarm.
-            if self._is_intro_template(path):
-                search = band
-            else:
-                search = roi
-            if search.shape[0] <= th or search.shape[1] <= tw:
-                search = gray
-            try:
-                res = cv2.matchTemplate(search, tmpl, cv2.TM_SQDIFF_NORMED)
-                min_val = float(np.nanmin(res))
-            except Exception:
-                continue
-            if not np.isfinite(min_val):
-                continue
-            if min_val < best_any_score:
-                best_any_score = min_val
-            thr = self._threshold_for_template(path)
-            if min_val <= thr and min_val < best_pass_score:
-                best_pass_score = min_val
-                best_pass_path = path
+
+        def _scan(items):
+            nonlocal best_pass_score, best_pass_path, best_any_score
+            for path, tmpl in items:
+                th, tw = tmpl.shape[:2]
+                if tw >= fw or th >= fh:
+                    continue
+                # Intro 说明窗: only search the mid dialog band with a tight score
+                # so sky/cloud patches cannot trip the alarm.
+                if self._is_intro_template(path):
+                    search = band
+                else:
+                    search = roi
+                if search.shape[0] <= th or search.shape[1] <= tw:
+                    search = gray
+                try:
+                    res = cv2.matchTemplate(search, tmpl, cv2.TM_SQDIFF_NORMED)
+                    min_val = float(np.nanmin(res))
+                except Exception:
+                    continue
+                if not np.isfinite(min_val):
+                    continue
+                if min_val < best_any_score:
+                    best_any_score = min_val
+                thr = self._threshold_for_template(path)
+                if min_val <= thr and min_val < best_pass_score:
+                    best_pass_score = min_val
+                    best_pass_path = path
+
+        cheap = [(p, t) for p, t in self._tmpl_list if not self._is_intro_template(p)]
+        intro = [(p, t) for p, t in self._tmpl_list if self._is_intro_template(p)]
+        _scan(cheap)
+        if not best_pass_path:
+            _scan(intro)
         if best_pass_path:
             self._last_score = best_pass_score
             return (
@@ -1145,6 +1319,7 @@ class LieAlert:
                     self._last_score = 0.0
                     return kw
         return ""
+
     def _should_block_follow_for_intro(self, img_bgr, now: float) -> bool:
         """Block mouse-follow while countdown/instruction text is still visible.
 
@@ -1410,6 +1585,10 @@ class LieAlert:
         return ((x - bx) ** 2 + (y - by) ** 2) <= (r * r)
 
     def _follow_shape(self, img_bgr, capture, now: float):
+        # If the main loop stalled (YOLO load etc.), wall-clock stale timers lie.
+        prev_tick = float(getattr(self, "_follow_tick_t", 0.0) or 0.0)
+        gap = (now - prev_tick) if prev_tick > 0 else 0.0
+        self._follow_tick_t = now
         pt = self._locate_shape(img_bgr, now)
         if pt is not None:
             # White can park on a static false highlight. Keep stale-unlock
@@ -1417,7 +1596,11 @@ class LieAlert:
             name = getattr(self, "_last_shape_name", "") or ""
             white_phase = name == "white" and float(getattr(self, "_white_gone_t", 0.0) or 0.0) <= 0.0
             if white_phase:
-                if self._lock_anchor_xy is None:
+                if gap >= max(0.5, float(self.stale_lock_s)):
+                    # Loop was frozen — reset stale clock; do not unlock.
+                    self._lock_anchor_xy = (float(pt[0]), float(pt[1]))
+                    self._lock_moved_t = now
+                elif self._lock_anchor_xy is None:
                     self._lock_anchor_xy = (float(pt[0]), float(pt[1]))
                     self._lock_moved_t = now
                 else:
@@ -1434,11 +1617,9 @@ class LieAlert:
             self._locked = True
             self.debug_pt = (int(pt[0]), int(pt[1]))
             self.following = True
-            # Top-up sticky only while it is already active (keeps mid-game
-            # recording/AFK pause alive when OCR misses). Do not resurrect hold
-            # after clear — map clutter lock must not freeze AFK forever.
-            if now < float(self._hold_until):
-                self._hold_until = max(self._hold_until, now + 2.5)
+            # Top-up sticky while following so a 35s hold does not end mid-game
+            # after a long stall (00:16:48 + 35s == session end).
+            self._hold_until = max(float(self._hold_until), now + 8.0)
             self._move_mouse_to_frame_point(pt, capture)
             if now - self._follow_log_t > 1.0:
                 self._follow_log_t = now
@@ -2398,23 +2579,30 @@ class LieAlert:
                 best = (float(mx), float(cx), float(cy), bbox, float(ang_use))
         return best
 
-    def _ensure_shape_peak_model(self):
+    def _ensure_shape_peak_model(self, allow_block: bool = True):
         if self._shape_peak_model is not None:
             return self._shape_peak_model
         if bool(getattr(self, "_shape_peak_failed", False)):
+            return None
+        if not allow_block:
+            # Follow hot path: never sync-load; kick background warm.
+            self._warm_track_models_async()
             return None
         path = str(getattr(self, "shape_peak_model_path", "") or "").strip()
         if not path or not os.path.exists(path):
             self._shape_peak_failed = True
             return None
-        try:
-            self._shape_peak_model = ShapePeakModel(path)
-            self._shape_peak_model._ensure_session()
-            logger.info(f"[LieAlert] Shape-peak model ready ({path})")
-        except Exception as exc:
-            logger.warning(f"[LieAlert] Shape-peak model unavailable ({exc})")
-            self._shape_peak_model = None
-            self._shape_peak_failed = True
+        with self._model_load_lock:
+            if self._shape_peak_model is not None:
+                return self._shape_peak_model
+            try:
+                self._shape_peak_model = ShapePeakModel(path)
+                self._shape_peak_model._ensure_session()
+                logger.info(f"[LieAlert] Shape-peak model ready ({path})")
+            except Exception as exc:
+                logger.warning(f"[LieAlert] Shape-peak model unavailable ({exc})")
+                self._shape_peak_model = None
+                self._shape_peak_failed = True
         return self._shape_peak_model
 
     def _find_all_shape_peaks(self, img_bgr, max_peaks: int = 10):
@@ -2425,7 +2613,8 @@ class LieAlert:
         """
         if not self._ensure_shape_silhouette(img_bgr):
             return []
-        model = self._ensure_shape_peak_model()
+        # Never block the detect/follow thread on ONNX load.
+        model = self._ensure_shape_peak_model(allow_block=False)
         if model is None:
             return []
         fh, fw = img_bgr.shape[:2]
@@ -2997,24 +3186,106 @@ class LieAlert:
         _x, _y, bw, bh = [int(v) for v in bbox]
         return (bw * bh) < 0.60 * float(nw * nh)
 
-    def _ensure_fade_yolo(self):
+    def _resolve_yolo_device(self) -> str:
+        """Pick ultralytics device: prefers CUDA when fade_yolo_device=auto."""
+        pref = str(getattr(self, "fade_yolo_device", "auto") or "auto").strip().lower()
+        if pref in ("cpu", "cuda") or pref.startswith("cuda:"):
+            if pref != "cpu":
+                try:
+                    import torch
+
+                    if not torch.cuda.is_available():
+                        logger.warning(
+                            "[LieAlert] fade_yolo_device=%s but CUDA unavailable — using cpu",
+                            pref,
+                        )
+                        return "cpu"
+                except Exception:
+                    return "cpu"
+            return pref
+        # auto
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                logger.info(f"[LieAlert] YOLO device=cuda:0 ({name})")
+                return "cuda:0"
+        except Exception:
+            pass
+        logger.info("[LieAlert] YOLO device=cpu (no CUDA torch)")
+        return "cpu"
+
+    def _warm_track_models_async(self):
+        """Load peak/YOLO in a daemon so the first follow frames stay responsive."""
+        if bool(getattr(self, "_track_models_warming", False)):
+            return
+        if self._shape_peak_model is not None and self._fade_yolo is not None:
+            return
+        self._track_models_warming = True
+
+        def _job():
+            try:
+                self._ensure_shape_peak_model(allow_block=True)
+                yolo = self._ensure_fade_yolo(allow_block=True)
+                # First ultralytics predict is slow — burn it off-thread.
+                if yolo is not None:
+                    try:
+                        import numpy as np
+
+                        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+                        device = self._fade_yolo_device_resolved or "cpu"
+                        yolo.predict(
+                            dummy,
+                            conf=0.25,
+                            verbose=False,
+                            imgsz=640,
+                            device=device,
+                        )
+                        logger.info(
+                            f"[LieAlert] Fade YOLO warm-predict done (device={device})"
+                        )
+                    except Exception as exc:
+                        logger.debug(f"[LieAlert] YOLO warm-predict: {exc}")
+            except Exception as exc:
+                logger.debug(f"[LieAlert] warm models: {exc}")
+            finally:
+                self._track_models_warming = False
+
+        threading.Thread(target=_job, daemon=True, name="lie-warm-models").start()
+
+    def _ensure_fade_yolo(self, allow_block: bool = True):
         if self._fade_yolo_failed:
             return None
         if self._fade_yolo is not None:
             return self._fade_yolo
+        if not allow_block:
+            # Critical: follow thread must NOT load YOLO (was ~28s freeze).
+            self._warm_track_models_async()
+            return None
         path = str(getattr(self, "fade_yolo_path", "") or "")
         if not path or not os.path.exists(path):
             self._fade_yolo_failed = True
             return None
-        try:
-            from ultralytics import YOLO
+        with self._model_load_lock:
+            if self._fade_yolo is not None:
+                return self._fade_yolo
+            try:
+                from ultralytics import YOLO
 
-            self._fade_yolo = YOLO(path)
-            logger.info(f"[LieAlert] Fade YOLO ready ({path})")
-        except Exception as exc:
-            logger.warning(f"[LieAlert] Fade YOLO unavailable ({exc})")
-            self._fade_yolo = None
-            self._fade_yolo_failed = True
+                device = self._resolve_yolo_device()
+                self._fade_yolo_device_resolved = device
+                self._fade_yolo = YOLO(path)
+                try:
+                    self._fade_yolo.to(device)
+                except Exception:
+                    # predict(device=...) still works if .to fails on some builds
+                    pass
+                logger.info(f"[LieAlert] Fade YOLO ready ({path}) device={device}")
+            except Exception as exc:
+                logger.warning(f"[LieAlert] Fade YOLO unavailable ({exc})")
+                self._fade_yolo = None
+                self._fade_yolo_failed = True
         return self._fade_yolo
 
     def _pick_fade_yolo(self, img_bgr):
@@ -3024,12 +3295,20 @@ class LieAlert:
         current center, not the highest score.
         Returns (conf, cx, cy, bbox) or None.
         """
-        model = self._ensure_fade_yolo()
+        # Never sync-load on the follow path.
+        model = self._ensure_fade_yolo(allow_block=False)
         if model is None:
             return None
         conf_min = max(0.10, float(getattr(self, "fade_yolo_conf", 0.20)))
+        device = self._fade_yolo_device_resolved or "cpu"
         try:
-            pred = model.predict(img_bgr, conf=conf_min, verbose=False, imgsz=640)
+            pred = model.predict(
+                img_bgr,
+                conf=conf_min,
+                verbose=False,
+                imgsz=640,
+                device=device,
+            )
         except Exception:
             return None
         if not pred or pred[0].boxes is None or len(pred[0].boxes) == 0:
@@ -3910,46 +4189,39 @@ class LieAlert:
         self.following = False
         logger.info(f"[LieAlert] {reason}")
 
-    def _user_driving_before_follow(self) -> bool:
-        """True if the user already moved the cursor during delay (before our first snap)."""
-        if self._mouse_yielded or self._mouse_placed_xy is not None:
-            return False
-        pos = self._cursor_pos()
-        watch = self._mouse_watch_xy
-        if pos is None or watch is None:
-            return False
-        thr = max(8.0, float(self.mouse_takeover_px))
-        dist = ((pos[0] - watch[0]) ** 2 + (pos[1] - watch[1]) ** 2) ** 0.5
-        if dist < thr:
-            return False
-        self._yield_to_user(
-            f"user already driving before follow "
-            f"(moved {dist:.0f}px from session cursor) — no auto snap"
-        )
-        return True
-
     def _watch_user_mouse(self):
         """
-        Stop mouse-follow only when the *real* cursor is moved by the user.
+        Stop mouse-follow only when the *real* cursor is moved by the user
+        AFTER our first snap.
 
-        If SetCursorPos/SendInput did not stick (cursor still near the
-        pre-follow spot while far from our commanded point), that is NOT a
-        user takeover — keep trying to move. Only yield when the cursor has
-        left both the commanded point and the pre-move watch point.
+        Pre-follow (intro delay): only refresh the baseline. A bump, dialog
+        focus jump, or accidental nudge must NOT abort AFK follow — that was
+        the 2026-11-03 21:19 failure (70px → permanent yield, zero snaps).
+
+        After we command the cursor: if SetCursorPos/SendInput did not stick
+        (still near the pre-move spot while far from commanded), keep trying.
+        Yield only when the cursor left both commanded and pre-move points.
         """
         if self._mouse_yielded:
             return
         pos = self._cursor_pos()
         if pos is None:
             return
-        # Before our first move: freeze the baseline once. Do NOT chase the
-        # cursor — otherwise manual play during delay hides the takeover and
-        # we still snap to the shape center seconds later.
+        # Before first snap: keep baseline current; never permanent-yield.
         if self._mouse_placed_xy is None:
-            if self._mouse_watch_xy is None:
-                self._mouse_watch_xy = pos
-            elif self._user_driving_before_follow():
-                return
+            prev = self._mouse_watch_xy
+            if prev is not None:
+                thr = max(8.0, float(self.mouse_takeover_px))
+                dist = ((pos[0] - prev[0]) ** 2 + (pos[1] - prev[1]) ** 2) ** 0.5
+                if dist >= thr:
+                    now = time.time()
+                    if now - float(getattr(self, "_pre_follow_move_log_t", 0.0) or 0.0) > 1.0:
+                        self._pre_follow_move_log_t = now
+                        logger.info(
+                            f"[LieAlert] cursor moved {dist:.0f}px during delay "
+                            f"— still auto-follow (baseline refresh)"
+                        )
+            self._mouse_watch_xy = pos
             return
         # Only grace when the last move actually landed; otherwise stuck
         # detection must run even if we keep issuing SetCursorPos every frame.
@@ -4081,10 +4353,6 @@ class LieAlert:
 
     def _move_mouse_to_frame_point(self, pt, capture):
         if self._mouse_yielded:
-            return
-        # Last check before the first snap — never yank the cursor off a
-        # player who already started the mini-game during our delay.
-        if self._mouse_placed_xy is None and self._user_driving_before_follow():
             return
         self._warn_mouse_elevation_block(capture)
         sx, sy = self._frame_to_screen(pt, capture)

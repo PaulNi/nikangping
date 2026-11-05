@@ -121,6 +121,10 @@ class MonsterDetector:
         self._hunt_edge_stall_frames = 0
         self._hunt_edge_enter_t = None
         self._hunt_edge_enter_side = None
+        # F2: after N mid-zone 往返, one pass uses full minimap width.
+        self._patrol_round_trips = 0
+        self._patrol_leg_count = 0
+        self._patrol_full_map = False
 
         # In-place attack "walk about" state machine (prevents attack lockout)
         self._in_place_state = "attack"       # "attack" | "pre_walk" | "walk_away" | "walk_back"
@@ -897,6 +901,12 @@ class MonsterDetector:
             return False
         if self.img_frame_gray is None:
             return False
+        # Flash patrol mainly uses minimap yellow; name can run every N frames.
+        name_every = max(1, int(name_cfg.get("name_every_n", 1)))
+        if name_every > 1 and (self.frame_count % name_every) != 0:
+            if self.loc_name is not None and self.loc_player not in (None, (0, 0)):
+                return True
+            return False
 
         match_threshold = float(name_cfg.get("match_threshold", 0.22))
         offset = name_cfg.get("offset", [0, -55])
@@ -1515,25 +1525,43 @@ class MonsterDetector:
 
     def _detect_minimap(self):
         """
-        Detect minimap via white border (reference project pattern).
-        Falls back to config if detection fails.
+        Prefer fixed config minimap (flash_patrol). Full-frame white-border
+        auto-detect is expensive (~10–40ms) — only refresh on an interval.
         """
-        # Try auto-detection first (white border method)
+        mm_cfg = self.cfg.get("minimap", {}) or {}
+        cfg_box = None
+        if mm_cfg.get("width", 0) > 10 and mm_cfg.get("height", 0) > 10:
+            cfg_box = (
+                int(mm_cfg["x"]),
+                int(mm_cfg["y"]),
+                int(mm_cfg["width"]),
+                int(mm_cfg["height"]),
+            )
+
+        auto_every = float(mm_cfg.get("auto_detect_interval_s", 3.0) or 0.0)
+        now = time.time()
+        cached = getattr(self, "_minimap_cached", None)
+        last_t = float(getattr(self, "_minimap_auto_t", 0.0) or 0.0)
+
+        # Fast path: trust config / cache between rare auto refreshes.
+        if cfg_box is not None and (auto_every <= 0 or (now - last_t) < auto_every):
+            return cached or cfg_box
+
+        self._minimap_auto_t = now
         result = get_minimap_loc_size(self.img_frame)
         if result:
             x, y, w_m, h_m = result
             if self.frame_count == 1:
                 logger.info(f"[Minimap] Auto-detected: ({x},{y}) {w_m}x{h_m}")
-            # Keep a 1px inset from border, but reject degenerate auto-detects.
             x_i, y_i, w_i, h_i = (x + 1, y + 1, w_m - 2, h_m - 2)
             if w_i > 0 and h_i > 0:
-                return (x_i, y_i, w_i, h_i)
+                self._minimap_cached = (x_i, y_i, w_i, h_i)
+                return self._minimap_cached
 
-        # Fallback to config
-        mm_cfg = self.cfg.get("minimap", {})
-        if mm_cfg.get("width", 0) > 10 and mm_cfg.get("height", 0) > 10:
-            return (mm_cfg["x"], mm_cfg["y"], mm_cfg["width"], mm_cfg["height"])
-        return None
+        if cfg_box is not None:
+            self._minimap_cached = cfg_box
+            return cfg_box
+        return cached
 
     # -------------------------------------------------------------------
     # Route following
@@ -1865,6 +1893,55 @@ class MonsterDetector:
         self._hunt_no_monster_frames = 0
         self._hunt_search_last_reason = "target"
 
+    def reset_patrol_cycle(self):
+        """Reset mid↔full-map cycle (call when F2 profile enables)."""
+        self._patrol_round_trips = 0
+        self._patrol_leg_count = 0
+        self._patrol_full_map = False
+
+    def _patrol_effective_ratios(self, cfg):
+        """Return (left_ratio, right_ratio); full-map override when cycle is active."""
+        left = cfg.get("search_left_ratio", None)
+        right = cfg.get("search_right_ratio", None)
+        if left is None or right is None:
+            return left, right
+        every = int(cfg.get("search_full_map_every_round_trips", 0) or 0)
+        if every > 0 and bool(getattr(self, "_patrol_full_map", False)):
+            return (
+                float(cfg.get("search_full_map_left_ratio", 0.0)),
+                float(cfg.get("search_full_map_right_ratio", 1.0)),
+            )
+        return float(left), float(right)
+
+    def _on_patrol_leg_flip(self, cfg):
+        """Count mid-zone 往返; after N, run one full-map pass then resume mid."""
+        every = int(cfg.get("search_full_map_every_round_trips", 0) or 0)
+        if every <= 0:
+            return
+        self._patrol_leg_count = int(getattr(self, "_patrol_leg_count", 0) or 0) + 1
+        if bool(getattr(self, "_patrol_full_map", False)):
+            need = max(1, int(cfg.get("search_full_map_legs", 2) or 2))
+            if self._patrol_leg_count >= need:
+                self._patrol_full_map = False
+                self._patrol_leg_count = 0
+                self._patrol_round_trips = 0
+                logger.info("[Patrol] full-map pass done — resume mid zone")
+            return
+        # Mid zone: 2 one-way legs = 1 往返
+        if self._patrol_leg_count >= 2:
+            self._patrol_leg_count = 0
+            self._patrol_round_trips = int(getattr(self, "_patrol_round_trips", 0) or 0) + 1
+            logger.info(
+                f"[Patrol] mid 往返 {self._patrol_round_trips}/{every}"
+            )
+            if self._patrol_round_trips >= every:
+                self._patrol_full_map = True
+                self._patrol_leg_count = 0
+                self._patrol_round_trips = 0
+                logger.info(
+                    f"[Patrol] after {every} mid 往返 — next pass FULL map"
+                )
+
     def _smooth_hunt_x(self, raw_x, src):
         """EMA-smooth hunt X; reset when coordinate source/scale changes."""
         da = self.cfg.get("directional_attack", {}) or {}
@@ -2004,9 +2081,13 @@ class MonsterDetector:
             if fw > 1:
                 sr = float(self.loc_player[0]) / fw
 
-        screen_edge = float(mm_cfg.get("search_wall_screen_ratio", 0.88))
+        screen_edge = float(mm_cfg.get("search_wall_screen_ratio", 0.86))
         screen_edge = min(0.95, max(0.70, screen_edge))
         agree = bool(mm_cfg.get("search_wall_screen_agree", True))
+        # When still walking into a side, screen edge alone can force a turn —
+        # yellow often freezes mid-map then snaps to the physical wall (logs:
+        # raw 87→114, flip only at yr=0.92 past the 0.80 soft bound).
+        dir_screen = bool(mm_cfg.get("search_wall_dir_screen", True))
 
         if yr is None and have_name and sr is not None:
             # Yellow missing: screen fallback (symmetric).
@@ -2016,10 +2097,29 @@ class MonsterDetector:
             elif sr <= float(left_ratio):
                 force_right = True
                 bits.append(f"screen_left:{sr:.2f}")
-        elif yr is not None and have_name and sr is not None:
-            # Agree-only: character visually jammed on that screen edge AND
-            # yellow already on that same half → treat as wall stick.
-            if agree:
+        elif have_name and sr is not None:
+            if dir_screen:
+                # NEVER let a stuck nameplate (s≈0.90 while yellow is left)
+                # fight yellow_left_approach every frame — that was the F2
+                # left/right thrash on 2026-11-03 21:43.
+                if hunt_dir == "right" and sr >= screen_edge:
+                    if yr is None or yr >= max(0.50, float(right_ratio) - 0.22):
+                        force_left = True
+                        bits.append(f"dir_screen_right:s={sr:.2f}")
+                    else:
+                        bits.append(
+                            f"dir_screen_ignore(s={sr:.2f},y={yr:.2f})"
+                        )
+                if hunt_dir == "left" and sr <= (1.0 - screen_edge):
+                    if yr is None or yr <= min(0.50, float(left_ratio) + 0.22):
+                        force_right = True
+                        bits.append(f"dir_screen_left:s={sr:.2f}")
+                    else:
+                        bits.append(
+                            f"dir_screen_ignore(s={sr:.2f},y={yr:.2f})"
+                        )
+            if yr is not None and agree:
+                # Extra: yellow already on that half + screen jammed.
                 if (
                     sr >= screen_edge
                     and yr >= 0.55
@@ -2034,9 +2134,9 @@ class MonsterDetector:
                 ):
                     force_right = True
                     bits.append(f"screen_agree_left:s={sr:.2f},y={yr:.2f}")
-            # Log contradictions only; never let screen alone override yellow.
-            if (sr >= float(right_ratio) and yr < 0.55) or (
-                sr <= float(left_ratio) and yr > 0.45
+            if yr is not None and (
+                (sr >= float(right_ratio) and yr < 0.55 and hunt_dir != "right")
+                or (sr <= float(left_ratio) and yr > 0.45 and hunt_dir != "left")
             ):
                 bits.append(f"name_ignore_vs_yellow(s={sr:.2f},y={yr:.2f})")
 
@@ -2098,10 +2198,10 @@ class MonsterDetector:
         flip_reason = None
         self._hunt_dir_forced = False
         # Minimap/global edge flip: reach left/right end (or mid-zone bounds) -> turn around
-        # search_left_ratio / search_right_ratio: fraction of span width (e.g. 0.10/0.90 = mid 80%)
+        # search_left_ratio / search_right_ratio: fraction of span width (e.g. 0.10/0.90)
+        # After N mid 往返, one pass uses search_full_map_* (default 0%~100%).
         edge_px = float(cfg.get("search_edge_px", 18))
-        left_ratio = cfg.get("search_left_ratio", None)
-        right_ratio = cfg.get("search_right_ratio", None)
+        left_ratio, right_ratio = self._patrol_effective_ratios(cfg)
         span_w = 0.0
         mid_zone = (left_ratio is not None and right_ratio is not None)
         sticky_frames = max(0, int(cfg.get("search_dir_sticky_frames", 60 if mid_zone else 0)))
@@ -2163,13 +2263,12 @@ class MonsterDetector:
                             self._hunt_edge_enter_t = None
                             self._hunt_edge_enter_side = None
 
-                    # Edge-stall: raw yellow not progressing toward current dir while
-                    # already near that mid-zone bound (or map third). Catches false
-                    # yellow locks while the char is pressing a physical wall / pad.
+                    # Edge-stall: raw yellow not progressing toward current dir.
+                    # Also fire past zone mid (false yellow often freezes ~0.5–0.65
+                    # while the char is already on the physical wall).
                     edge_stall_n = max(0, int(cfg.get("search_edge_stall_frames", 10)))
                     edge_stall_third = float(cfg.get("search_edge_stall_third", 0.40))
                     edge_stall_min_delta = float(cfg.get("search_edge_stall_min_delta_px", 1.0))
-                    # Bound-relative stall band (ratio of span); default ~8% past soft bound.
                     stall_band = float(cfg.get("search_edge_stall_bound_band", 0.08))
                     edge_stall_hit = False
                     if raw_mm_x is not None and edge_stall_n > 0 and span_w > 0:
@@ -2191,14 +2290,19 @@ class MonsterDetector:
                             self._hunt_edge_stall_frames = 0
                         self._hunt_edge_last_raw_x = raw_mm_x
                         _yr2 = raw_mm_x / span_w
-                        near_left = _yr2 <= max(
-                            edge_stall_third,
+                        # Stall ONLY near the configured soft bounds — NOT past
+                        # zone mid (that made the whole half-map a stall zone and
+                        # flipped every ~5 frames while cruising).
+                        left_stall_cut = min(
                             float(left_ratio) + max(0.0, stall_band),
+                            max(0.05, float(edge_stall_third)),
                         )
-                        near_right = _yr2 >= min(
-                            1.0 - edge_stall_third,
+                        right_stall_cut = max(
                             float(right_ratio) - max(0.0, stall_band),
+                            min(0.95, 1.0 - float(edge_stall_third)),
                         )
+                        near_left = _yr2 <= left_stall_cut
+                        near_right = _yr2 >= right_stall_cut
                         if self._hunt_edge_stall_frames >= edge_stall_n:
                             if self._hunt_search_dir == "left" and near_left:
                                 edge_stall_hit = True
@@ -2254,45 +2358,62 @@ class MonsterDetector:
                             except Exception:
                                 pass
 
+                        # Hard yellow wall (past cut) may flip immediately.
+                        # Approach / dir_screen / stall need a gap or they
+                        # oscillate when nameplate and yellow disagree.
+                        hard_yellow = (
+                            "yellow_left:" in force_detail
+                            or "yellow_right:" in force_detail
+                            or reason in ("mid_in_left", "mid_in_right")
+                        )
+                        flip_gap = max(0, int(cfg.get("search_flip_min_frames", 12)))
+                        since_flip = self.frame_count - int(
+                            getattr(self, "_hunt_dir_change_frame", 0) or 0
+                        )
+                        allow_flip = hard_yellow or since_flip >= flip_gap
                         if self._hunt_search_dir != desired:
-                            # Bound/force ALWAYS flips — sticky never blocks.
-                            prev_dir = self._hunt_search_dir
-                            self._hunt_search_dir = desired
-                            flip_reason = reason
-                            self._hunt_dir_forced = True
-                            self._hunt_dir_change_frame = self.frame_count
-                            stall_now = int(getattr(self, "_hunt_edge_stall_frames", 0))
-                            self._hunt_edge_stall_frames = 0
-                            # Snap EMA to raw so next frames don't lag behind the wall.
-                            if raw_mm_x is not None:
-                                self._hunt_smooth_x = float(raw_mm_x)
-                            _patrol_force_dir(desired)
-                            # Brief attack pause so jump_attack does not immediately
-                            # leap back into the wall; walk away one step first.
-                            try:
-                                kb = getattr(self, "_kb", None)
-                                pause_s = float(cfg.get("search_flip_attack_pause_s", 0.25))
-                                if kb is not None and pause_s > 0:
-                                    kb._attack_pause_until = max(
-                                        float(getattr(kb, "_attack_pause_until", 0.0)),
-                                        _time.time() + pause_s,
-                                    )
-                            except Exception:
-                                pass
-                            raw_s = f"{raw_mm_x:.1f}" if raw_mm_x is not None else "na"
-                            enter_t = getattr(self, "_hunt_edge_enter_t", None)
-                            dt_ms = (
-                                (_time.time() - enter_t) * 1000.0 if enter_t else -1.0
-                            )
-                            logger.info(
-                                f"[Patrol] FLIP {prev_dir}->{desired} reason={reason} "
-                                f"x={progress_x:.1f}/{progress_src} raw={raw_s} "
-                                f"bounds=[{left_bound:.0f},{right_bound:.0f}]/"
-                                f"{span_w:.0f} force={force_detail} "
-                                f"stall={stall_now} flip_dt_ms={dt_ms:.0f}"
-                            )
-                            self._hunt_edge_enter_t = None
-                            self._hunt_edge_enter_side = None
+                            if allow_flip:
+                                # Bound/force flips after gap (hard yellow: immediate).
+                                prev_dir = self._hunt_search_dir
+                                self._hunt_search_dir = desired
+                                flip_reason = reason
+                                self._hunt_dir_forced = True
+                                self._hunt_dir_change_frame = self.frame_count
+                                stall_now = int(getattr(self, "_hunt_edge_stall_frames", 0))
+                                self._hunt_edge_stall_frames = 0
+                                # Snap EMA to raw so next frames don't lag behind the wall.
+                                if raw_mm_x is not None:
+                                    self._hunt_smooth_x = float(raw_mm_x)
+                                _patrol_force_dir(desired)
+                                # Brief attack pause so jump_attack does not immediately
+                                # leap back into the wall; walk away one step first.
+                                try:
+                                    kb = getattr(self, "_kb", None)
+                                    pause_s = float(cfg.get("search_flip_attack_pause_s", 0.25))
+                                    if kb is not None and pause_s > 0:
+                                        kb._attack_pause_until = max(
+                                            float(getattr(kb, "_attack_pause_until", 0.0)),
+                                            _time.time() + pause_s,
+                                        )
+                                except Exception:
+                                    pass
+                                raw_s = f"{raw_mm_x:.1f}" if raw_mm_x is not None else "na"
+                                enter_t = getattr(self, "_hunt_edge_enter_t", None)
+                                dt_ms = (
+                                    (_time.time() - enter_t) * 1000.0 if enter_t else -1.0
+                                )
+                                logger.info(
+                                    f"[Patrol] FLIP {prev_dir}->{desired} reason={reason} "
+                                    f"x={progress_x:.1f}/{progress_src} raw={raw_s} "
+                                    f"bounds=[{left_bound:.0f},{right_bound:.0f}]/"
+                                    f"{span_w:.0f} force={force_detail} "
+                                    f"stall={stall_now} flip_dt_ms={dt_ms:.0f}"
+                                )
+                                self._hunt_edge_enter_t = None
+                                self._hunt_edge_enter_side = None
+                            else:
+                                # Cooldown: keep current dir (blocks nameplate↔yellow thrash).
+                                self._hunt_dir_forced = False
                         else:
                             # Already facing the turn dir. Only rarely re-hold while
                             # pinned on a HARD wall — every-3-frame re-press was
@@ -2365,7 +2486,8 @@ class MonsterDetector:
                                         f"age={self.frame_count - steer_frame}/{mob_sticky}"
                                     )
                     # Brief per-turn debug (throttled)
-                    if self.frame_count % 15 == 0:
+                    log_n = max(15, int((self.cfg.get("system") or {}).get("hunt_log_every_n", 45)))
+                    if self.frame_count % log_n == 0:
                         lr = getattr(self, "_hunt_mob_last_lr", (0, 0))
                         raw_s = f"{raw_mm_x:.1f}" if raw_mm_x is not None else "na"
                         logger.info(
@@ -2554,6 +2676,8 @@ class MonsterDetector:
             if progress_x is not None:
                 self._hunt_search_anchor_x = progress_x
                 self._hunt_search_last_progress_x = progress_x
+            if mid_zone and flash_patrol:
+                self._on_patrol_leg_flip(cfg)
 
         max_sweeps = int(cfg.get("search_max_sweeps", 0))
         if max_sweeps > 0 and self._hunt_search_sweeps >= max_sweeps:
@@ -2945,15 +3069,25 @@ class MonsterDetector:
             self.update_cmd_by_route()
             route_action = self.cmd_action
 
-        # Prepare debug frame before player detect so NAME/TITLE boxes can draw this frame.
-        if self.is_show_debug:
+        # Prepare debug frame before player detect so NAME/TITLE boxes can draw.
+        # Only every N frames — full-res .copy()+overlay was a major stutter source.
+        viz_every = max(1, int(
+            (self.cfg.get("monster_detect") or {}).get("display_every_n", 2)
+        ))
+        self._do_viz = bool(self.is_show_debug) and (self.frame_count % viz_every == 0)
+        if self._do_viz:
             self.img_frame_debug = self.img_frame.copy()
         else:
             self.img_frame_debug = None
 
         # Detect player: prefer floating nameplate. On name miss in hunt, use screen
         # center (not sticky wrong title) so monster ROI / max_dy stay valid.
-        found_name = self._detect_player_by_name()
+        # During 测谎 follow, skip nameplate — AFK is paused and CPU goes to mouse track.
+        lie_busy = False
+        la = getattr(self, "lie_alert", None)
+        if la is not None:
+            lie_busy = bool(getattr(la, "visible", False) or getattr(la, "following", False))
+        found_name = False if lie_busy else self._detect_player_by_name()
         if not found_name:
             name_enabled = bool(self.cfg.get("player_name", {}).get("enable", True)) and self.img_name_gray is not None
             hunt_mode = self.cfg.get("bot", {}).get("mode") == "hunt"
@@ -3179,7 +3313,8 @@ class MonsterDetector:
                             move_x, move_y, action = patrol_x, patrol_y, patrol_action
 
 
-            if mode == "hunt" and self.frame_count % 15 == 0:
+            log_n = max(15, int((self.cfg.get("system") or {}).get("hunt_log_every_n", 45)))
+            if mode == "hunt" and self.frame_count % log_n == 0:
                 dx_log = None
                 if mode == "hunt":
                     try:
@@ -3211,7 +3346,8 @@ class MonsterDetector:
                     f"monsters={len(self.monsters)} L/R={lr[0]}/{lr[1]} dx={dx_log} chase={getattr(self._kb,'_chase_active',False)} "
                     f"dispatch=({move_x},{move_y},{action}) "
                     f"search=(noMob:{self._hunt_no_monster_frames},dir:{self._hunt_search_dir},"
-                    f"last:{self._hunt_search_last_reason},x={px_mm}/{px_src}{zone})"
+                    f"last:{self._hunt_search_last_reason},x={px_mm}/{px_src}{zone}) "
+                    f"fps={self.fps}"
                 )
 
             # Buff casting / initial buff wait: force stand still, no attack.
@@ -3230,8 +3366,8 @@ class MonsterDetector:
                     pass
             self._kb.set_command(f"{move_x} {move_y} {action}")
 
-        # Always draw decorations on debug frame
-        if self.is_show_debug:
+        # Draw decorations only on viz ticks (img_frame_debug is None otherwise).
+        if self.is_show_debug and self.img_frame_debug is not None:
             self._update_debug_overlay()        # Text first (bottom layer)
             self._draw_search_region(x0, y0, x1, y1)  # Search border
             # 测谎 star follow reticle (same idea as the demo video overlay)
@@ -3324,18 +3460,18 @@ class MonsterDetector:
                     thickness=2, text_height=0.5
                 )
 
-        # Pre-scale display frame in background thread
-            scale = self.cfg["monster_detect"].get("display_scale", 0.55)
+            # Pre-scale for UI thread (only when we built a debug frame).
+            scale = float(
+                (self.cfg.get("monster_detect") or {}).get("display_scale", 0.55)
+            )
             if scale != 1.0:
                 self.img_display = cv2.resize(
                     self.img_frame_debug, None,
                     fx=scale, fy=scale,
-                    interpolation=cv2.INTER_NEAREST
+                    interpolation=cv2.INTER_AREA,
                 )
             else:
                 self.img_display = self.img_frame_debug
-
-            # Signal a new renderable frame for the UI thread.
             self.frame_seq += 1
 
         self.is_frame_done = True
@@ -3398,6 +3534,15 @@ class MonsterDetector:
             # FPS shown on overlay should reflect full loop time (including cap sleep).
             loop_duration = time.time() - t_start
             self.fps = round(1.0 / max(loop_duration, 0.001))
+            # Periodic loop health — makes 2fps freezes obvious in the log.
+            now_log = time.time()
+            if now_log - float(getattr(self, "_fps_log_t", 0.0) or 0.0) >= 5.0:
+                self._fps_log_t = now_log
+                logger.info(
+                    f"[Loop] fps={self.fps} frame_ms={frame_duration*1000:.0f} "
+                    f"viz={int(bool(self.is_show_debug))} "
+                    f"lie={int(bool(getattr(getattr(self,'lie_alert',None),'visible',False)))}"
+                )
 
     def cleanup(self):
         """Clean up resources."""

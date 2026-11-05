@@ -41,6 +41,8 @@ def main():
                         help="Enable debug logging")
     parser.add_argument("--disable_viz", action="store_true",
                         help="Disable the debug visualization window")
+    parser.add_argument("--enable_viz", action="store_true",
+                        help="Force-enable the debug visualization window")
     args = parser.parse_args()
 
     if args.debug:
@@ -75,9 +77,14 @@ def main():
     else:
         logger.info(f"  No custom config found at {custom_cfg_path}")
 
-    if args.disable_viz:
+    if args.enable_viz:
+        cfg["disable_viz"] = False
+        logger.info("  Debug visualization: enabled (--enable_viz)")
+    elif args.disable_viz:
         cfg["disable_viz"] = True
         logger.info("  Debug visualization: disabled")
+    elif bool(cfg.get("disable_viz", False)):
+        logger.info("  Debug visualization: disabled (config); press F10 to toggle")
 
     # -------------------------------------------------------------------
     # Initialize the monster detector
@@ -132,6 +139,23 @@ def main():
     # Register F11 to toggle bot mode (detect <-> hunt)
     kb_listener.register_func_key_handler('f11', detector.toggle_mode)
 
+    def _toggle_viz():
+        detector.is_show_debug = not bool(getattr(detector, "is_show_debug", False))
+        cfg["disable_viz"] = not detector.is_show_debug
+        logger.info(
+            f"[Viz] monitor window {'ON' if detector.is_show_debug else 'OFF'} (F10)"
+        )
+        if not detector.is_show_debug:
+            detector.img_display = None
+            detector.img_frame_debug = None
+            try:
+                cv2.destroyWindow("NewMaple")
+            except Exception:
+                pass
+
+    kb_listener.register_func_key_handler('f10', _toggle_viz)
+    logger.info("Hotkeys: F10=toggle monitor window  F11=detect/hunt")
+
     # -------------------------------------------------------------------
     # Main thread: display loop (matches reference: main() while loop)
     # Processing runs in background, display never blocks.
@@ -140,52 +164,80 @@ def main():
     window_positioned = False
     last_frame_seq = -1
     t_last_display = time.time()
-
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     try:
-        # Keep monitor visible but avoid forcing it above the game forever.
-        cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 0)
-    except Exception:
-        pass
+        display_fps_cap = float((cfg.get("system") or {}).get("display_fps_limit", 15))
+    except (TypeError, ValueError):
+        display_fps_cap = 15.0
+    display_fps_cap = max(5.0, min(60.0, display_fps_cap))
+    display_min_dt = 1.0 / display_fps_cap
+    viz_window_ready = False
 
-    def _on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            detector.request_title_selection_from_display(x, y)
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            detector.clear_title_selection()
+    def _ensure_viz_window():
+        nonlocal viz_window_ready, window_positioned
+        if viz_window_ready:
+            return
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        try:
+            cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 0)
+        except Exception:
+            pass
 
-    cv2.setMouseCallback(win_name, _on_mouse)
+        def _on_mouse(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                detector.request_title_selection_from_display(x, y)
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                detector.clear_title_selection()
+
+        cv2.setMouseCallback(win_name, _on_mouse)
+        viz_window_ready = True
+        window_positioned = False
+
+    if detector.is_show_debug:
+        _ensure_viz_window()
 
     try:
         while not detector.is_terminated:
-            # Show debug image — only when a new frame is ready
-            # (exact same pattern as reference: MapleStoryAutoLevelUp.py:1851-1864)
-            if detector.is_frame_done and detector.frame_seq != last_frame_seq:
-                if detector.img_display is not None:
-                    cv2.imshow(win_name, detector.img_display)
-                    now = time.time()
-                    detector.display_fps = round(1.0 / max(now - t_last_display, 0.001))
-                    t_last_display = now
-                    last_frame_seq = detector.frame_seq
+            now = time.time()
+            if detector.is_show_debug:
+                _ensure_viz_window()
+                # Show debug image — new frame + display FPS cap (imshow is costly).
+                if (
+                    detector.is_frame_done
+                    and detector.frame_seq != last_frame_seq
+                    and (now - t_last_display) >= display_min_dt
+                ):
+                    if detector.img_display is not None:
+                        cv2.imshow(win_name, detector.img_display)
+                        detector.display_fps = round(
+                            1.0 / max(now - t_last_display, 0.001)
+                        )
+                        t_last_display = now
+                        last_frame_seq = detector.frame_seq
 
-                    if not window_positioned:
-                        try:
-                            import ctypes
-                            user32 = ctypes.windll.user32
-                            get_system_metrics = getattr(user32, "GetSystemMetrics")
-                            screen_w = get_system_metrics(0)
-                            screen_h = get_system_metrics(1)
-                            rect = cv2.getWindowImageRect(win_name)
-                            if rect:
-                                _, _, win_w, win_h = rect
-                                cv2.moveWindow(win_name,
-                                               screen_w - win_w - 20,
-                                               screen_h - win_h - 100)
-                                window_positioned = True
-                        except Exception:
-                            pass
+                        if not window_positioned:
+                            try:
+                                import ctypes
+                                user32 = ctypes.windll.user32
+                                get_system_metrics = getattr(user32, "GetSystemMetrics")
+                                screen_w = get_system_metrics(0)
+                                screen_h = get_system_metrics(1)
+                                rect = cv2.getWindowImageRect(win_name)
+                                if rect:
+                                    _, _, win_w, win_h = rect
+                                    cv2.moveWindow(
+                                        win_name,
+                                        screen_w - win_w - 20,
+                                        screen_h - win_h - 100,
+                                    )
+                                    window_positioned = True
+                            except Exception:
+                                pass
+                key = cv2.waitKey(8) & 0xFF
+            else:
+                # No OpenCV window — don't spin waitKey; sleep lightly.
+                time.sleep(0.03)
+                key = 0xFF
 
-            key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:
                 logger.info("Quit key pressed.")
                 detector.is_terminated = True
@@ -195,8 +247,6 @@ def main():
                 logger.info("Screenshot saved.")
             elif key == ord('c'):
                 detector.clear_title_selection()
-
-            # No extra fixed sleep: let waitKey pump events smoothly.
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")

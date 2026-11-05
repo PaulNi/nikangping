@@ -87,6 +87,8 @@ def main():
     frame_i = 0
     trail = []
     decoy_frames = 0
+    # Per-second lock samples for PASS/FAIL gates (wall time from video fps).
+    lock_by_sec = {}  # sec -> [locked_bool, ...]
     win = "LieAlert (RED=center)"
     if not args.no_preview:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -100,6 +102,7 @@ def main():
             break
 
         now = t0 + frame_i / max(1.0, fps)
+        t_sec = frame_i / max(1.0, fps)
         if frame_i <= 15:
             la._learn_background(frame, locked=False)
             pt = None
@@ -115,6 +118,8 @@ def main():
                 pt = la._track_xy
             if la._locked:
                 locked_frames += 1
+        sec_i = int(t_sec)
+        lock_by_sec.setdefault(sec_i, []).append(bool(la._locked and pt is not None))
 
         vis = frame.copy()
         name = getattr(la, "_last_shape_name", "") or "-"
@@ -211,6 +216,48 @@ def main():
     print("frames_with_decoys", decoy_frames)
     print("out_video", os.path.abspath(args.out))
     print("samples", os.path.abspath(sample_dir))
+
+    def _rate(lo: float, hi: float) -> float:
+        vals = []
+        for s, arr in lock_by_sec.items():
+            if lo <= s < hi:
+                vals.extend(arr)
+        if not vals:
+            return 0.0
+        return 100.0 * sum(1 for v in vals if v) / len(vals)
+
+    # Stable gates (eyeball windows from skill): white ~2–6s, fade ~7–11s.
+    # Only score windows that actually exist in this clip.
+    dur = frame_i / max(1.0, fps)
+    white_r = _rate(2.0, min(6.0, dur))
+    fade_r = _rate(7.0, min(11.0, dur)) if dur >= 7.5 else None
+    late_r = _rate(11.0, min(15.0, dur)) if dur >= 12.0 else None
+    print("--- pass/fail ---")
+    print(f"clip_duration     {dur:.1f}s")
+    print(f"white_lock_2_6s   {white_r:.1f}%  (need >= 70)")
+    if fade_r is None:
+        print("fade_lock_7_11s   SKIP (clip < 7.5s)")
+    else:
+        print(f"fade_lock_7_11s   {fade_r:.1f}%  (need >= 55)")
+    if late_r is None:
+        print("late_lock_11_15s  SKIP (clip < 12s)")
+    else:
+        print(f"late_lock_11_15s  {late_r:.1f}%  (need >= 40)")
+    ok_white = white_r >= 70.0
+    ok_fade = True if fade_r is None else fade_r >= 55.0
+    ok_late = True if late_r is None else late_r >= 40.0
+    passed = ok_white and ok_fade and ok_late
+    print("VERDICT", "PASS" if passed else "FAIL")
+    if not passed:
+        bad = []
+        if not ok_white:
+            bad.append("white")
+        if not ok_fade:
+            bad.append("fade")
+        if not ok_late:
+            bad.append("late-spin")
+        print("failed_gates", ",".join(bad))
+        return 2
     return 0
 
 

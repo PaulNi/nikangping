@@ -1,0 +1,11 @@
+# NVIDIA CUDA PyTorch (RTX 40-series / 4070 etc.)
+# Install with:
+#   tools\setup_cuda_torch.bat
+# or:
+#   pip uninstall -y torch torchvision torchaudio
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+# Then: pip install -r requirements.txt
+#
+# Verify:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"

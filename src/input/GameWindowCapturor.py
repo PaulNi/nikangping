@@ -36,6 +36,15 @@ class GameWindowCapturor:
             logger.info(f"[GameWindowCapturor] Test image loaded: {self.frame.shape}")
             self.fps = 0
             self.window_title = ""
+            # Keep same double-buffer attrs as live mode so get_frame() works.
+            self._pending = None
+            self._active = self.frame
+            self.region = {
+                "left": 0,
+                "top": 0,
+                "width": int(self.frame.shape[1]),
+                "height": int(self.frame.shape[0]),
+            }
             return
 
         # Live capture mode
@@ -57,12 +66,22 @@ class GameWindowCapturor:
         self.fps = 0
         self.fps_limit = cfg["system"]["fps_limit_window_capturor"]
         self.t_last_run = 0.0
+        # FindWindow every tick is expensive; refresh geometry on an interval.
+        self._region_interval_s = float(
+            (cfg.get("system") or {}).get("capturor_region_interval_s", 0.5)
+        )
+        self._t_last_region = 0.0
+        # Double-buffer: capture writes _pending; get_frame swaps into _active
+        # without copying the full frame (was a major stutter source).
+        self._pending = None
+        self._active = None
 
         # Use mss to capture the screen region
         self.capture = mss.mss()
 
         # Get initial window region
         self.update_window_region()
+        self._t_last_region = time.time()
 
         # Start capture in daemon thread (matches macOS reference exactly)
         threading.Thread(target=self.start_capture, daemon=True).start()
@@ -75,7 +94,10 @@ class GameWindowCapturor:
     def start_capture(self):
         """Capture loop — runs in daemon thread."""
         while not self.is_terminated:
-            self.update_window_region()
+            now = time.time()
+            if (now - float(self._t_last_region)) >= max(0.1, self._region_interval_s):
+                self.update_window_region()
+                self._t_last_region = now
             self.capture_frame()
             self.limit_fps()
 
@@ -153,11 +175,12 @@ class GameWindowCapturor:
                 self._t_last_region_err = now
 
     def capture_frame(self):
-        """Capture the current game window region."""
+        """Capture the current game window region (store BGR once in this thread)."""
         if self.region is None or self.region.get("width", 0) < 400 or self.region.get("height", 0) < 300:
             # Invalidate so hunt will not chase on a frozen old frame
             with self.lock:
                 self.frame = None
+                self._pending = None
             return
 
         try:
@@ -166,42 +189,55 @@ class GameWindowCapturor:
             if frame is None or frame.size == 0 or frame.shape[0] < 300 or frame.shape[1] < 400:
                 with self.lock:
                     self.frame = None
+                    self._pending = None
                 return
+            # Convert + crop here so the detect thread does not pay cvtColor every get.
+            title_bar_height = int(
+                (self.cfg.get("game_window") or {}).get("title_bar_height", 0) or 0
+            )
+            if title_bar_height > 0:
+                if title_bar_height >= frame.shape[0]:
+                    with self.lock:
+                        self.frame = None
+                        self._pending = None
+                    return
+                frame = frame[title_bar_height:, :, :]
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            elif frame.shape[2] == 3:
+                # mss is BGRA; rare path already BGR
+                pass
             with self.lock:
-                self.frame = frame
+                # Do not touch _active — detect thread may still be reading it.
+                self._pending = frame
+                self.frame = frame  # legacy readers / first-frame wait
         except Exception as e:
             logger.debug(f"[GameWindowCapturor] grab error: {e}")
             with self.lock:
                 self.frame = None
+                self._pending = None
 
     def get_frame(self):
         """
         Thread-safe getter for the latest game frame.
 
         Returns:
-            BGR numpy array, or None if no frame is available.
+            BGR numpy array (no full-frame copy). Capture writes a new buffer
+            into _pending; we swap it to _active for exclusive detect use.
         """
         with self.lock:
-            if self.frame is None:
+            if self._pending is not None:
+                self._active = self._pending
+                self._pending = None
+                self.frame = self._active
+            if self._active is None:
                 return None
-            # Only grab reference inside lock — convert outside
-            frame_ref = self.frame
-
-        if frame_ref is None or getattr(frame_ref, "size", 0) == 0:
-            return None
-        if len(frame_ref.shape) < 3 or frame_ref.shape[0] <= 0 or frame_ref.shape[1] <= 0:
-            return None
-
-        # Convert BGRA (mss format) to BGR outside lock (avoids blocking capture)
-        title_bar_height = self.cfg["game_window"].get("title_bar_height", 0)
-        if title_bar_height > 0:
-            if title_bar_height >= frame_ref.shape[0]:
+            frame_ref = self._active
+            if frame_ref is None or getattr(frame_ref, "size", 0) == 0:
                 return None
-            cropped = frame_ref[title_bar_height:, :, :]
-            if cropped is None or cropped.size == 0:
+            if len(frame_ref.shape) < 3 or frame_ref.shape[0] <= 0 or frame_ref.shape[1] <= 0:
                 return None
-            return cv2.cvtColor(cropped, cv2.COLOR_BGRA2BGR)
-        return cv2.cvtColor(frame_ref, cv2.COLOR_BGRA2BGR)
+            return frame_ref
 
     def limit_fps(self):
         """Limit FPS to save system resources."""
