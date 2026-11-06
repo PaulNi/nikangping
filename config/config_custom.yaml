@@ -250,7 +250,9 @@ lie_alert:
   record_draw_track: false
   dialog_miss_limit: 5           # 连续漏检几次才结束会话（太小会中途掐录像）
   dialog_min_session_s: 40.0     # 开局这么久内不因漏检提前结束（盖住白形+整段褪色）
-  mouse_takeover_px: 55          # 仅在首次吸鼠之后判定抢鼠；倒计时微移不再永久放弃
+  mouse_takeover_px: 40          # 首次吸鼠后：偏离或按住鼠标键 → 让出，本场不再抢
+  mouse_move_grace_s: 0.08       # 仅忽略落点附近抖动；大挪移立刻让出（勿再拉高）
+  white_miss_grace_s: 0.45       # 白形短暂漏检先停住，勿立刻切 YOLO
   # 倒计时约 3s；检到说明窗才等这段。OCR 检晚且说明窗已消失则 delay=0 立刻吸鼠
   follow_start_delay_s: 1.0
   follow_timeout_s: 90.0
@@ -265,6 +267,7 @@ lie_alert:
   fade_yolo_step_scale: 2.2         # YOLO 跟形步长相对 max_frame_step_px 的倍数
   fade_yolo_hold_frames: 4          # YOLO 漏检时短暂停在上次框，少交给 flow/coast
   fade_yolo_search_scale: 6.0       # 多框时相对当前中心的搜索半径（×max_frame_step_px）
+  fade_yolo_min_interval_s: 0.12    # YOLO 推理最小间隔；CPU 会再抬到 ≥0.28s
   acquire_min_score: 0.48
   track_min_score: 0.28
   template_min_score: 0.86

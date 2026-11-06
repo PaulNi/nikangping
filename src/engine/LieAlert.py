@@ -113,8 +113,13 @@ class LieAlert:
         self.exclude_top_ratio = float(la.get("exclude_top_ratio", 0.08))
         self.mouse_smooth = float(la.get("mouse_smooth", 0.55))
         self.mouse_takeover_px = float(la.get("mouse_takeover_px", 30.0))
-        self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.25))
+        # Short settle only; never use this to ignore a large user yank.
+        self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.08))
         self.lose_target_grace_s = float(la.get("lose_target_grace_s", 1.2))
+        # White can flicker 1–2 frames at low FPS; do not flip to YOLO immediately.
+        self.white_miss_grace_s = float(la.get("white_miss_grace_s", 0.45))
+        # Wall-clock YOLO throttle (CPU predict was freezing the AFK loop ~2fps).
+        self.fade_yolo_min_interval_s = float(la.get("fade_yolo_min_interval_s", 0.12))
         self.motion_weight = float(la.get("motion_weight", 0.25))
         self.template_weight = float(la.get("template_weight", 0.55))
         scales = (
@@ -204,6 +209,9 @@ class LieAlert:
         self._mouse_fail_log_t = 0.0
         self._mouse_elev_warned = False
         self._mouse_yielded = False  # user took the mouse; stop follow this session
+        self._white_miss_since = 0.0  # wall clock of first consecutive white miss
+        self._yolo_last_infer_t = 0.0
+        self._yolo_last_hit = None  # cached (conf,cx,cy,bbox) between throttled runs
         self._follow_log_t = 0.0
         self._prev_gray = None  # for motion tracking
         self._last_shape_name = ""
@@ -391,7 +399,16 @@ class LieAlert:
             la.get("mouse_takeover_px", self.mouse_takeover_px)
         )
         self.mouse_move_grace_s = float(
-            la.get("mouse_move_grace_s", getattr(self, "mouse_move_grace_s", 0.25))
+            la.get("mouse_move_grace_s", getattr(self, "mouse_move_grace_s", 0.08))
+        )
+        self.white_miss_grace_s = float(
+            la.get("white_miss_grace_s", getattr(self, "white_miss_grace_s", 0.45))
+        )
+        self.fade_yolo_min_interval_s = float(
+            la.get(
+                "fade_yolo_min_interval_s",
+                getattr(self, "fade_yolo_min_interval_s", 0.12),
+            )
         )
         self.lose_target_grace_s = float(
             la.get("lose_target_grace_s", self.lose_target_grace_s)
@@ -1021,6 +1038,9 @@ class LieAlert:
             self._mouse_watch_xy = None
             self._mouse_last_move_t = 0.0
             self._mouse_last_move_ok = False
+            self._white_miss_since = 0.0
+            self._yolo_last_infer_t = 0.0
+            self._yolo_last_hit = None
             self._track_xy = None
             self._track_vel = (0.0, 0.0)
             self._locked = False
@@ -1125,6 +1145,9 @@ class LieAlert:
         self._mouse_last_move_ok = False
         self._mouse_elev_warned = False
         self._mouse_yielded = False
+        self._white_miss_since = 0.0
+        self._yolo_last_infer_t = 0.0
+        self._yolo_last_hit = None
         self._prev_gray = None
         self._last_shape_name = ""
         self._timeout_logged = False
@@ -1562,6 +1585,9 @@ class LieAlert:
         self._lock_age = 0
         self._coast_streak = 0
         self._white_gone_t = 0.0
+        self._white_miss_since = 0.0
+        self._yolo_last_infer_t = 0.0
+        self._yolo_last_hit = None
         self._target_indep_vel = (0.0, 0.0)
         self._target_angle = None
         self._target_angle_t = 0.0
@@ -3301,6 +3327,17 @@ class LieAlert:
             return None
         conf_min = max(0.10, float(getattr(self, "fade_yolo_conf", 0.20)))
         device = self._fade_yolo_device_resolved or "cpu"
+        now = time.time()
+        # CPU YOLO every frame dropped the loop to ~2fps and lost the white
+        # target (2026-11-06). Throttle + reuse last hit between runs.
+        min_gap = float(getattr(self, "fade_yolo_min_interval_s", 0.12) or 0.12)
+        if str(device).startswith("cpu"):
+            min_gap = max(min_gap, 0.28)
+        last_t = float(getattr(self, "_yolo_last_infer_t", 0.0) or 0.0)
+        if last_t > 0.0 and (now - last_t) < min_gap:
+            cached = getattr(self, "_yolo_last_hit", None)
+            return cached
+        self._yolo_last_infer_t = now
         try:
             pred = model.predict(
                 img_bgr,
@@ -3310,8 +3347,10 @@ class LieAlert:
                 device=device,
             )
         except Exception:
+            self._yolo_last_hit = None
             return None
         if not pred or pred[0].boxes is None or len(pred[0].boxes) == 0:
+            self._yolo_last_hit = None
             return None
         boxes = []
         for b in pred[0].boxes:
@@ -3326,30 +3365,33 @@ class LieAlert:
                 )
             )
         boxes.sort(key=lambda t: -t[0])
+        hit = None
         # Prefer accepting YOLO more often after fade (still nearest-to-center).
         if len(boxes) == 1 and boxes[0][0] >= conf_min:
-            return boxes[0]
-        if self._track_xy is None:
-            return boxes[0] if boxes[0][0] >= conf_min + 0.05 else None
-        tx, ty = float(self._track_xy[0]), float(self._track_xy[1])
-        search = max(4.0, float(getattr(self, "fade_yolo_search_scale", 6.0)))
-        limit = float(self.max_frame_step_px) * search
-        near = []
-        for item in boxes:
-            if item[0] < conf_min:
-                continue
-            dist = ((item[1] - tx) ** 2 + (item[2] - ty) ** 2) ** 0.5
-            if dist <= limit:
-                near.append((dist, item))
-        if near:
-            near.sort(key=lambda t: t[0])
-            return near[0][1]
-        # Strong lone lead may reacquire even farther away.
-        if boxes[0][0] >= max(0.45, conf_min + 0.18) and (
-            len(boxes) == 1 or boxes[0][0] >= boxes[1][0] + 0.12
-        ):
-            return boxes[0]
-        return None
+            hit = boxes[0]
+        elif self._track_xy is None:
+            hit = boxes[0] if boxes[0][0] >= conf_min + 0.05 else None
+        else:
+            tx, ty = float(self._track_xy[0]), float(self._track_xy[1])
+            search = max(4.0, float(getattr(self, "fade_yolo_search_scale", 6.0)))
+            limit = float(self.max_frame_step_px) * search
+            near = []
+            for item in boxes:
+                if item[0] < conf_min:
+                    continue
+                dist = ((item[1] - tx) ** 2 + (item[2] - ty) ** 2) ** 0.5
+                if dist <= limit:
+                    near.append((dist, item))
+            if near:
+                near.sort(key=lambda t: t[0])
+                hit = near[0][1]
+            elif boxes[0][0] >= max(0.45, conf_min + 0.18) and (
+                len(boxes) == 1 or boxes[0][0] >= boxes[1][0] + 0.12
+            ):
+                # Strong lone lead may reacquire even farther away.
+                hit = boxes[0]
+        self._yolo_last_hit = hit
+        return hit
 
     def _locate_shape(self, img_bgr, now: float):
         """
@@ -3418,6 +3460,7 @@ class LieAlert:
                 wscore, wcx, wcy, wbbox = whit
                 if wscore >= max(0.28, self.track_min_score * 0.85) and not self._white_blob_shrunken(wbbox):
                     self._white_gone_t = 0.0
+                    self._white_miss_since = 0.0
                     dx = wcx - self._track_xy[0]
                     dy = wcy - self._track_xy[1]
                     dist = (dx * dx + dy * dy) ** 0.5
@@ -3471,6 +3514,16 @@ class LieAlert:
                         self._seed_flow_and_patch(gray, cx, cy, self.debug_bbox)
                     self._prev_gray = gray
                     return self._track_xy
+
+            # White miss: hold last white pose for a short grace so a 1–2 frame
+            # flicker at ~2fps does not flip straight into YOLO/fill (12:22 fail).
+            if float(getattr(self, "_white_miss_since", 0.0) or 0.0) <= 0.0:
+                self._white_miss_since = float(now)
+            miss_age = now - float(self._white_miss_since)
+            white_grace = max(0.15, float(getattr(self, "white_miss_grace_s", 0.45)))
+            if self._white_gone_t <= 0.0 and miss_age < white_grace:
+                self._prev_gray = gray
+                return self._track_xy
 
             # White just disappeared (~7s): mark fade and hunt faded silhouette.
             # Decoys share one path; only the target moves randomly AND spins.
@@ -4187,22 +4240,42 @@ class LieAlert:
     def _yield_to_user(self, reason: str):
         self._mouse_yielded = True
         self.following = False
+        self.debug_pt = None
         logger.info(f"[LieAlert] {reason}")
+
+    def _mouse_button_down(self) -> bool:
+        """True if L/R mouse button is held — clear player intervene signal."""
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            # VK_LBUTTON=0x01, VK_RBUTTON=0x02; high bit set while pressed
+            return bool(user32.GetAsyncKeyState(0x01) & 0x8000) or bool(
+                user32.GetAsyncKeyState(0x02) & 0x8000
+            )
+        except Exception:
+            return False
 
     def _watch_user_mouse(self):
         """
-        Stop mouse-follow only when the *real* cursor is moved by the user
-        AFTER our first snap.
+        Stop mouse-follow when the player takes over AFTER our first snap.
 
         Pre-follow (intro delay): only refresh the baseline. A bump, dialog
         focus jump, or accidental nudge must NOT abort AFK follow — that was
         the 2026-11-03 21:19 failure (70px → permanent yield, zero snaps).
 
-        After we command the cursor: if SetCursorPos/SendInput did not stick
-        (still near the pre-move spot while far from commanded), keep trying.
-        Yield only when the cursor left both commanded and pre-move points.
+        After we command the cursor: grace only ignores tiny settle jitter
+        near the commanded point. A large yank or mouse-button press yields
+        immediately — previously every-frame SetCursorPos kept us inside
+        grace forever so player intervene never fired (2026-11-06 12:22).
         """
         if self._mouse_yielded:
+            return
+        # After first snap: any click = player intervene → stop fighting.
+        if self._mouse_placed_xy is not None and self._mouse_button_down():
+            self._yield_to_user(
+                "user mouse button — stop auto-follow (player intervene)"
+            )
             return
         pos = self._cursor_pos()
         if pos is None:
@@ -4223,19 +4296,24 @@ class LieAlert:
                         )
             self._mouse_watch_xy = pos
             return
-        # Only grace when the last move actually landed; otherwise stuck
-        # detection must run even if we keep issuing SetCursorPos every frame.
-        last_move_t = float(getattr(self, "_mouse_last_move_t", 0.0) or 0.0)
-        grace = float(getattr(self, "mouse_move_grace_s", 0.25) or 0.25)
-        landed = bool(getattr(self, "_mouse_last_move_ok", False))
-        if landed and last_move_t > 0.0 and (time.time() - last_move_t) < grace:
-            return
         thr = max(8.0, float(self.mouse_takeover_px))
         anchor = self._mouse_placed_xy
         dist_cmd = ((pos[0] - anchor[0]) ** 2 + (pos[1] - anchor[1]) ** 2) ** 0.5
         if dist_cmd < thr:
             # Cursor is where we put it — refresh watch for next comparison.
             self._mouse_watch_xy = pos
+            return
+        # Settle grace ONLY when still near commanded (OS lag / smooth).
+        # Far from commanded → fall through even if we just SetCursorPos.
+        last_move_t = float(getattr(self, "_mouse_last_move_t", 0.0) or 0.0)
+        grace = float(getattr(self, "mouse_move_grace_s", 0.08) or 0.08)
+        landed = bool(getattr(self, "_mouse_last_move_ok", False))
+        if (
+            landed
+            and last_move_t > 0.0
+            and (time.time() - last_move_t) < grace
+            and dist_cmd < thr * 1.5
+        ):
             return
         watch = self._mouse_watch_xy
         if watch is not None:
@@ -4353,6 +4431,12 @@ class LieAlert:
 
     def _move_mouse_to_frame_point(self, pt, capture):
         if self._mouse_yielded:
+            return
+        # Last chance: if player already yanked/clicked, do not fight this frame.
+        if self._mouse_placed_xy is not None and self._mouse_button_down():
+            self._yield_to_user(
+                "user mouse button — stop auto-follow (player intervene)"
+            )
             return
         self._warn_mouse_elevation_block(capture)
         sx, sy = self._frame_to_screen(pt, capture)
