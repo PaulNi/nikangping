@@ -174,6 +174,7 @@ class LieAlert:
         self._tmpl_missing_logged = False
         self._was_visible = False
         self._last_alert_t = 0.0
+        self._session_alert_played = False
         self._last_score = 1.0
         self._last_hit = ""
         self._hold_until = 0.0
@@ -339,6 +340,12 @@ class LieAlert:
         # the main loop (~28s YOLO load on 2026-11-05 00:17).
         if self.enable and self.auto_follow:
             self._warm_track_models_async()
+        # Prebuild alert WAV so the first 测谎 hit is not delayed by synth.
+        if self.enable:
+            try:
+                self._alert_wav_path()
+            except Exception:
+                pass
 
     def reload_cfg(self, cfg: dict):
         """Refresh settings after profile switch (paths usually stay global)."""
@@ -901,15 +908,16 @@ class LieAlert:
             self._dialog_miss = 0
             self._rearm_after_t = now + max(1.0, self.rearm_cooldown_s)
 
-        # Timeout a follow session (log once; cool down before re-arm).
-        # If OCR still sees 测谎 title, extend instead of aborting mid-game.
+        # Timeout a follow/alert session (log once; cool down before re-arm).
+        # Alert-only: never sync OCR here (blocks ~2s). Follow mode may extend.
         if (sticky or found) and self._session_start_t > 0:
             if (now - self._session_start_t) > self.follow_timeout_s:
                 still_up = False
-                try:
-                    still_up = bool(self._match_ocr(img_frame_bgr))
-                except Exception:
-                    still_up = False
+                if self.auto_follow:
+                    try:
+                        still_up = bool(self._match_ocr(img_frame_bgr))
+                    except Exception:
+                        still_up = False
                 if still_up or found:
                     self._session_start_t = now - self.follow_timeout_s * 0.5
                     self._hold_until = max(self._hold_until, now + 8.0)
@@ -939,9 +947,11 @@ class LieAlert:
                 self._clip_post_until = 0.0
                 self._clip_write(img_frame_bgr)
             rising = not self._was_visible
-            # Alarm only on session start — sticky hold must not re-beep every N seconds.
-            if rising:
+            # Alarm fires in _on_dialog_found (first). Rising here is a fallback
+            # if sticky hold re-arms without a fresh find path.
+            if rising and not bool(getattr(self, "_session_alert_played", False)):
                 self._last_alert_t = now
+                self._session_alert_played = True
                 via = hit or self._last_hit or "hold"
                 logger.warning(
                     f"[ALERT] 测谎 detected via {via} (score={self._last_score:.3f}, "
@@ -1041,6 +1051,7 @@ class LieAlert:
             self._white_miss_since = 0.0
             self._yolo_last_infer_t = 0.0
             self._yolo_last_hit = None
+            self._session_alert_played = False
             self._track_xy = None
             self._track_vel = (0.0, 0.0)
             self._locked = False
@@ -1050,7 +1061,8 @@ class LieAlert:
             if self._session_start_t and now >= float(self._rearm_after_t):
                 self._session_start_t = 0.0
             self._prev_gray = None
-            self._reset_bg_model()
+            if self.auto_follow:
+                self._reset_bg_model()
 
         self._was_visible = self.visible
         return self.visible
@@ -1136,6 +1148,16 @@ class LieAlert:
         if self._was_visible:
             return
         self._session_start_t = now
+        # Fire siren FIRST on rising edge — before clip/BG/model warm so the
+        # laptop alert-only path has zero follow-related delay.
+        self._last_alert_t = now
+        self._session_alert_played = True
+        logger.warning(
+            f"[ALERT] 测谎 detected via {hit} (score={self._last_score:.3f}, "
+            f"hold={max(0.0, self._hold_until - now):.1f}s) — pause AFK"
+            + (", auto-follow shape" if self.auto_follow else ", answer manually")
+        )
+        self._play_loud_alert()
         self._track_xy = None
         self._track_vel = (0.0, 0.0)
         self._mouse_xy = None
@@ -1159,6 +1181,17 @@ class LieAlert:
         self._follow_started_logged = False
         self._delay_hold_log_t = 0.0
         self._intro_hold_log_t = 0.0
+        if not self.auto_follow:
+            # Alert-only: no follow delay, no BG model, no YOLO warm.
+            self._follow_ready_t = now
+            self._intro_block_until = 0.0
+            if self.record_clip:
+                self._clip_start(img_frame_bgr)
+            logger.info(
+                f"[LieAlert] session start — alert-only hit={hit} "
+                f"(auto_follow=False, record={int(self.record_clip)})"
+            )
+            return
         # Intro still up → wait out countdown. Late OCR (title only,
         # panel already gone) → arm immediately so we do not sit idle
         # after the game countdown already finished.

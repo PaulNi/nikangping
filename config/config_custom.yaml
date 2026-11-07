@@ -195,34 +195,34 @@ walk_teleport:
 # 多角色 / 模式：启动空闲；F1 / F2 / F3 加载对应配置并开始（再按同键关闭）
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 测谎 / 谎言探测仪：
-#   - 检出后响铃并暂停挂机
-#   - auto_follow=true：倒计时后跟随「任意」渐隐移动图形（不限星形；不点击）
+# 测谎 / 谎言探测仪（笔记本分支：仅报警，不跟形）
+#   - 模板一命中立刻响铃并暂停挂机（不等人手/OCR）
+#   - auto_follow=false：不吸鼠、不加载 YOLO/跟形模型
 # ---------------------------------------------------------------------------
 lie_alert:
   enable: true
   template: "assets/lie_detector/lie.png"
   match_threshold: 0.14          # EN 标题；SQDIFF 越小越像（勿再放宽到 0.22）
   cn_title_match_threshold: 0.030 # 中文标题必须几乎完美；手机裁图易误报
-  cn_title_require_ocr: true     # 中文标题命中后还要 OCR 确认，防误报
-  check_interval_frames: 4       # 模板便宜；OCR 另有墙钟门控
+  cn_title_require_ocr: false    # 笔记本：不要等 OCR，模板命中立刻报警
+  check_interval_frames: 1       # 每帧检模板，弹窗出现当帧就能报警
   alert_cooldown_s: 3.0
   freeze_seconds: 8.0
-  hold_seconds: 50.0             # 跟形中会续期；避免卡顿后 35s 到点直接结束
+  hold_seconds: 25.0             # 仅粘住暂停挂机；无跟形不必拉到 50s
   rearm_cooldown_s: 8.0          # 会话超时后冷却，避免立刻再误报循环
   center_roi_ratio: 0.90
   templates:
     - "assets/lie_detector/lie_en.png"
-    # 开场白底说明窗（「3秒后，测谎小游戏开始」）——一出现就报警+录像
+    # 开场白底说明窗（「3秒后，测谎小游戏开始」）——一出现就报警
     - "assets/lie_detector/lie_intro_banner.png"
     - "assets/lie_detector/lie_intro_body.png"
   intro_match_threshold: 0.025   # 说明窗模板；过松会把云层当弹窗
     # 手机截的 lie_cn_title.png 分辨率不对，默认不启用
     # - "assets/lie_detector/lie_cn_title.png"
   ocr_enable: true
-  # RapidOCR ~2s/次且已改异步；间隔仍拉大，避免后台线程抢 CPU
-  ocr_interval_frames: 120
-  ocr_min_interval_s: 5.0        # 异步提交最低间隔；跟形中不跑
+  # RapidOCR 仅作兜底；间隔拉大，不挡首响
+  ocr_interval_frames: 180
+  ocr_min_interval_s: 8.0
   ocr_during_follow: false
   ocr_keywords:
     - "谎言探测仪"
@@ -234,28 +234,25 @@ lie_alert:
     - "逐渐透明且移动"
     - "LIE DETECTOR"
     - "Lie Detector"
-  # —— 首锁白色图形 → 匀速光流/帧差续跟；绿色准星仅测试评分，不参与识别 ——
-  auto_follow: true
-  # 自动录像会拖垮跟形（上次墙钟 46s 只写出 56 帧 ≈1.2fps，鼠标吸中后几乎不动）。
-  # 需要素材时再临时改 true。
+  # 笔记本：关掉跟形（鼠标/YOLO/白形跟踪全部不跑）
+  auto_follow: false
   record_clip: false
   record_dir: "_debug_out/lie_clips"
   record_fps: 30
   record_pad_wallclock: false
   record_pad_max_frames: 2
-  record_preroll_s: 0              # 预录关闭（即便开启 record_clip 也不预拷）
+  record_preroll_s: 0
   record_preroll_fps: 5
   record_postroll_s: 0
   record_max_s: 120
   record_draw_track: false
-  dialog_miss_limit: 5           # 连续漏检几次才结束会话（太小会中途掐录像）
-  dialog_min_session_s: 40.0     # 开局这么久内不因漏检提前结束（盖住白形+整段褪色）
-  mouse_takeover_px: 40          # 首次吸鼠后：偏离或按住鼠标键 → 让出，本场不再抢
-  mouse_move_grace_s: 0.08       # 仅忽略落点附近抖动；大挪移立刻让出（勿再拉高）
-  white_miss_grace_s: 0.45       # 白形短暂漏检先停住，勿立刻切 YOLO
-  # 倒计时约 3s；检到说明窗才等这段。OCR 检晚且说明窗已消失则 delay=0 立刻吸鼠
-  follow_start_delay_s: 1.0
-  follow_timeout_s: 90.0
+  dialog_miss_limit: 3           # 无跟形：漏检几次就结束粘滞，尽快恢复挂机
+  dialog_min_session_s: 5.0      # 无跟形：不必硬撑 40s
+  mouse_takeover_px: 40
+  mouse_move_grace_s: 0.08
+  white_miss_grace_s: 0.45
+  follow_start_delay_s: 0.0      # 跟形已关；保留项不影响报警
+  follow_timeout_s: 60.0
   follow_interval_frames: 1
   shapes_dir: "assets/lie_detector/shapes"
   # 同形框和中心。红框仍由白形粘滞 / 旋转 / 同路径排斥决定，不用模型分数当中心。

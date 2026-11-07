@@ -97,7 +97,7 @@ class MonsterDetector:
         self.is_on_ladder = False
         self._kb = None  # Keyboard controller (set externally)
         self.health_monitor = None  # Health monitor (initialized in start())
-        self.lie_alert = LieAlert(cfg)  # 测谎 alert + optional star mouse-follow
+        self.lie_alert = LieAlert(cfg)  # 测谎 alert (+ optional mouse-follow if enabled)
 
         # Hunt-mode search state (used when no monsters are detected)
         self._hunt_no_monster_frames = 0
@@ -2993,7 +2993,7 @@ class MonsterDetector:
         # Convert to grayscale (for title detection + grayscale matching)
         self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
 
-        # 测谎 dialog: alert + pause AFK; auto_follow tracks the moving star with mouse
+        # 测谎 dialog: alert + pause AFK (mouse-follow only when auto_follow=true)
         if getattr(self, "lie_alert", None) is not None:
             try:
                 self.lie_alert.maybe_check(
