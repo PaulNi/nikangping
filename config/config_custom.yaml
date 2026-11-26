@@ -195,9 +195,9 @@ walk_teleport:
 # 多角色 / 模式：启动空闲；F1 / F2 / F3 加载对应配置并开始（再按同键关闭）
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 测谎 / 谎言探测仪（对标 gostart 高级模式：提醒 + 热力图跟形）
+# 测谎 / 谎言探测仪（笔记本：只报警不跟形）
 #   - 模板一命中立刻响铃并暂停挂机——「小游戏出现提醒」
-#   - auto_follow=true：确认开局白形后才移鼠；热力图 + 白形/YOLO 回退
+#   - auto_follow=false：不移鼠、不跑 YOLO/热力图跟形（本机无 CUDA，CPU 跟形易掉帧）
 # ---------------------------------------------------------------------------
 lie_alert:
   enable: true
@@ -235,9 +235,9 @@ lie_alert:
     - "逐渐透明且移动"
     - "LIE DETECTOR"
     - "Lie Detector"
-  auto_follow: true
+  auto_follow: false
   # gostart lie-detector-observation.onnx（特征对齐 _build_features，/255）
-  heatmap_enable: true
+  heatmap_enable: false
   heatmap_model: "assets/lie_detector/lie-detector-observation.onnx"
   heatmap_meta: "assets/lie_detector/lie-detector-observation.json"
   opening_confirm_frames: 4      # 连续白形命中后才首次移鼠
@@ -274,7 +274,10 @@ lie_alert:
   fade_yolo_step_scale: 2.2         # YOLO 跟形步长相对 max_frame_step_px 的倍数
   fade_yolo_hold_frames: 4          # YOLO 漏检时短暂停在上次框，少交给 flow/coast
   fade_yolo_search_scale: 6.0       # 多框时相对当前中心的搜索半径（×max_frame_step_px）
-  fade_yolo_min_interval_s: 0.12    # YOLO 推理最小间隔；CPU 会再抬到 ≥0.28s
+  fade_yolo_min_interval_s: 0.12    # YOLO 推理最小间隔；CPU 会再抬到 ≥0.55s 并按上次耗时自适应
+  fade_yolo_imgsz: 640              # CUDA 推理尺寸
+  fade_yolo_cpu_imgsz: 320          # CPU 缩小输入，避免全图 640 卡到数秒/帧
+  fade_yolo_crop_dialog: true       # 只在测谎对话框 ROI 上跑 YOLO
   acquire_min_score: 0.48
   track_min_score: 0.28
   template_min_score: 0.86

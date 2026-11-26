@@ -132,6 +132,11 @@ class LieAlert:
         self.white_miss_grace_s = float(la.get("white_miss_grace_s", 0.45))
         # Wall-clock YOLO throttle (CPU predict was freezing the AFK loop ~2fps).
         self.fade_yolo_min_interval_s = float(la.get("fade_yolo_min_interval_s", 0.12))
+        # Full-frame 640 on CPU can take multi-seconds (live 2026-11-26 ~6s/frame).
+        self.fade_yolo_imgsz = int(la.get("fade_yolo_imgsz", 640) or 640)
+        self.fade_yolo_cpu_imgsz = int(la.get("fade_yolo_cpu_imgsz", 320) or 320)
+        self.fade_yolo_crop_dialog = bool(la.get("fade_yolo_crop_dialog", True))
+        self._yolo_last_infer_ms = 0.0
         self.motion_weight = float(la.get("motion_weight", 0.25))
         self.template_weight = float(la.get("template_weight", 0.55))
         scales = (
@@ -491,6 +496,21 @@ class LieAlert:
             la.get(
                 "fade_yolo_min_interval_s",
                 getattr(self, "fade_yolo_min_interval_s", 0.12),
+            )
+        )
+        self.fade_yolo_imgsz = int(
+            la.get("fade_yolo_imgsz", getattr(self, "fade_yolo_imgsz", 640)) or 640
+        )
+        self.fade_yolo_cpu_imgsz = int(
+            la.get(
+                "fade_yolo_cpu_imgsz", getattr(self, "fade_yolo_cpu_imgsz", 320)
+            )
+            or 320
+        )
+        self.fade_yolo_crop_dialog = bool(
+            la.get(
+                "fade_yolo_crop_dialog",
+                getattr(self, "fade_yolo_crop_dialog", True),
             )
         )
         self.lose_target_grace_s = float(
@@ -1756,6 +1776,9 @@ class LieAlert:
         return ((x - bx) ** 2 + (y - by) ** 2) <= (r * r)
 
     def _follow_shape(self, img_bgr, capture, now: float):
+        # Poll yield first — follow ticks can be 1–6s apart when YOLO stalls.
+        if self._consume_middle_yield():
+            return
         # If the main loop stalled (YOLO load etc.), wall-clock stale timers lie.
         prev_tick = float(getattr(self, "_follow_tick_t", 0.0) or 0.0)
         gap = (now - prev_tick) if prev_tick > 0 else 0.0
@@ -1871,7 +1894,13 @@ class LieAlert:
                 )
             except Exception:
                 est = None
-            if est is not None and hm.may_move(est):
+            # Never drive the mouse from rejected-obs "predict" — that froze on
+            # a stale point and blocked YOLO/faded (2026-11-26 live fail).
+            if (
+                est is not None
+                and est.source in ("heatmap", "inject")
+                and hm.may_move(est)
+            ):
                 move_pt = (float(est.x), float(est.y))
                 move_src = f"heatmap/{est.source}"
                 self.debug_pt = (int(est.x), int(est.y))
@@ -1927,7 +1956,8 @@ class LieAlert:
             if hm is not None:
                 try:
                     pest = hm.predict_coast()
-                    if pest is not None and hm.may_move(pest):
+                    # Short coast only — may_move rejects predict by design.
+                    if pest is not None and float(pest.confidence) >= 0.15:
                         pred = (float(pest.x), float(pest.y))
                         move_src = "heatmap/predict"
                 except Exception:
@@ -3537,13 +3567,19 @@ class LieAlert:
                     try:
                         import numpy as np
 
-                        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
                         device = self._fade_yolo_device_resolved or "cpu"
+                        warm_sz = 320 if str(device).startswith("cpu") else 640
+                        if str(device).startswith("cpu"):
+                            warm_sz = max(
+                                160,
+                                int(getattr(self, "fade_yolo_cpu_imgsz", 320) or 320),
+                            )
+                        dummy = np.zeros((warm_sz, warm_sz, 3), dtype=np.uint8)
                         yolo.predict(
                             dummy,
                             conf=0.25,
                             verbose=False,
-                            imgsz=640,
+                            imgsz=warm_sz,
                             device=device,
                         )
                         logger.info(
@@ -3605,34 +3641,81 @@ class LieAlert:
             return None
         conf_min = max(0.10, float(getattr(self, "fade_yolo_conf", 0.20)))
         device = self._fade_yolo_device_resolved or "cpu"
+        on_cpu = str(device).startswith("cpu")
         now = time.time()
         # CPU YOLO every frame dropped the loop to ~2fps and lost the white
         # target (2026-11-06). Throttle + reuse last hit between runs.
         min_gap = float(getattr(self, "fade_yolo_min_interval_s", 0.12) or 0.12)
-        if str(device).startswith("cpu"):
-            min_gap = max(min_gap, 0.28)
+        if on_cpu:
+            # Adaptive: last multi-second infer must not re-fire immediately.
+            last_ms = float(getattr(self, "_yolo_last_infer_ms", 0.0) or 0.0)
+            min_gap = max(min_gap, 0.55, last_ms * 0.0015)
         last_t = float(getattr(self, "_yolo_last_infer_t", 0.0) or 0.0)
         if last_t > 0.0 and (now - last_t) < min_gap:
             cached = getattr(self, "_yolo_last_hit", None)
             return cached
         self._yolo_last_infer_t = now
+
+        fh, fw = img_bgr.shape[:2]
+        ox = oy = 0
+        infer_img = img_bgr
+        if bool(getattr(self, "fade_yolo_crop_dialog", True)):
+            x0, y0, x1, y1 = self._dialog_roi(fw, fh)
+            # Prefer title-aligned puzzle box when known (smaller + gostart crop).
+            title_tl = getattr(self, "_lie_title_tl", None)
+            if title_tl is not None:
+                try:
+                    from src.engine.lie_heatmap_tracker import puzzle_rect_from_title
+
+                    rect = puzzle_rect_from_title(title_tl, fw, fh)
+                    if rect is not None:
+                        x0, y0, x1, y1 = rect
+                except Exception:
+                    pass
+            x0 = max(0, min(fw - 8, int(x0)))
+            y0 = max(0, min(fh - 8, int(y0)))
+            x1 = max(x0 + 8, min(fw, int(x1)))
+            y1 = max(y0 + 8, min(fh, int(y1)))
+            crop = img_bgr[y0:y1, x0:x1]
+            if crop.size >= 64:
+                infer_img = crop
+                ox, oy = x0, y0
+
+        imgsz = int(getattr(self, "fade_yolo_imgsz", 640) or 640)
+        if on_cpu:
+            imgsz = int(getattr(self, "fade_yolo_cpu_imgsz", 320) or 320)
+        imgsz = max(160, min(640, imgsz))
+
+        t_infer0 = time.time()
         try:
             pred = model.predict(
-                img_bgr,
+                infer_img,
                 conf=conf_min,
                 verbose=False,
-                imgsz=640,
+                imgsz=imgsz,
                 device=device,
             )
         except Exception:
             self._yolo_last_hit = None
             return None
+        infer_ms = (time.time() - t_infer0) * 1000.0
+        self._yolo_last_infer_ms = float(infer_ms)
+        if infer_ms >= 800.0 and (
+            now - float(getattr(self, "_yolo_slow_log_t", 0.0) or 0.0) > 5.0
+        ):
+            self._yolo_slow_log_t = now
+            logger.warning(
+                f"[LieAlert] Fade YOLO slow {infer_ms:.0f}ms "
+                f"device={device} imgsz={imgsz} crop={infer_img.shape[1]}x{infer_img.shape[0]}"
+            )
         if not pred or pred[0].boxes is None or len(pred[0].boxes) == 0:
             self._yolo_last_hit = None
             return None
         boxes = []
         for b in pred[0].boxes:
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
+            x1, x2 = x1 + ox, x2 + ox
+            y1, y2 = y1 + oy, y2 + oy
             conf = float(b.conf[0])
             boxes.append(
                 (
@@ -4521,21 +4604,35 @@ class LieAlert:
         self.debug_pt = None
         logger.info(f"[LieAlert] {reason}")
 
-    def _middle_mouse_down(self) -> bool:
-        """True while middle mouse button is held (VK_MBUTTON)."""
+    def _middle_mouse_state(self) -> tuple:
+        """Return (currently_down, pressed_since_last_poll) for VK_MBUTTON."""
         try:
             import ctypes
 
-            return bool(ctypes.windll.user32.GetAsyncKeyState(0x04) & 0x8000)
+            state = int(ctypes.windll.user32.GetAsyncKeyState(0x04))
+            return bool(state & 0x8000), bool(state & 0x0001)
         except Exception:
-            return False
+            return False, False
 
-    def _middle_mouse_pressed(self) -> bool:
-        """Rising edge: middle button went down this tick (one press to intervene)."""
-        down = self._middle_mouse_down()
-        was = bool(getattr(self, "_middle_btn_was_down", False))
+    def _consume_middle_yield(self) -> bool:
+        """
+        True if middle button should stop follow this dialog.
+
+        Uses level (held) + GetAsyncKeyState 'was pressed' bit so a short click
+        is not missed when the main loop stalls at ~1fps (live 2026-11-26).
+        """
+        if self._mouse_yielded:
+            return True
+        down, queued = self._middle_mouse_state()
         self._middle_btn_was_down = down
-        return down and not was
+        # Level (held) or 'pressed since last poll' — rising-edge alone misses
+        # short clicks when LieAlert ticks at ~1fps.
+        if down or queued:
+            self._yield_to_user(
+                "middle-click — stop auto-follow (player intervene)"
+            )
+            return True
+        return False
 
     def _watch_user_mouse(self):
         """
@@ -4545,13 +4642,7 @@ class LieAlert:
         yields when SetCursorPos lagged or heatmap jumped (2026-11-26 337px).
         Far-from-command still re-snaps so the bot keeps ownership of the cursor.
         """
-        if self._mouse_yielded:
-            return
-        # Middle-click once → player takes over (works before first snap too).
-        if self._middle_mouse_pressed():
-            self._yield_to_user(
-                "middle-click — stop auto-follow (player intervene)"
-            )
+        if self._consume_middle_yield():
             return
         pos = self._cursor_pos()
         if pos is None:
@@ -4671,7 +4762,7 @@ class LieAlert:
                     return False
 
     def _move_mouse_to_frame_point(self, pt, capture):
-        if self._mouse_yielded:
+        if self._consume_middle_yield():
             return
         self._warn_mouse_elevation_block(capture)
         sx, sy = self._frame_to_screen(pt, capture)

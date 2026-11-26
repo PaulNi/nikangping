@@ -607,8 +607,9 @@ class LieHeatmapTracker:
             return False
         if not self._opening_confirmed:
             return False
+        # Rejected observations must not keep ownership of the cursor.
         if est.source == "predict":
-            return est.confidence >= self.control_min_confidence * 0.5
+            return False
         if est.secondary_ratio >= self.ambiguity_cap:
             return False
         return float(est.confidence) >= self.control_min_confidence
