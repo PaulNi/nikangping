@@ -128,6 +128,8 @@ class LieAlert:
         self.opening_confirm_frames = max(1, int(la.get("opening_confirm_frames", 4)))
         self.opening_confirm_timeout_s = float(la.get("opening_confirm_timeout_s", 8.0))
         self.heatmap_enable = bool(la.get("heatmap_enable", True))
+        # gostart-style: mouse from ONNX heatmap only (no Fade YOLO / classic mouse).
+        self.heatmap_only = bool(la.get("heatmap_only", False))
         # White can flicker 1–2 frames at low FPS; do not flip to YOLO immediately.
         self.white_miss_grace_s = float(la.get("white_miss_grace_s", 0.45))
         # Wall-clock YOLO throttle (CPU predict was freezing the AFK loop ~2fps).
@@ -196,6 +198,8 @@ class LieAlert:
         self._last_hit = ""
         self._hold_until = 0.0
         self._lie_title_tl = None  # frame (x,y) dialog title top-left for puzzle crop
+        self._lie_title_tl_t = 0.0  # last time title_tl was refreshed
+        self._lie_puzzle_xyxy = None  # optional tight puzzle box from chrome estimate
         self._dialog_miss = 0  # consecutive detect ticks without dialog confirm
         self.visible = False
         self.following = False
@@ -423,6 +427,9 @@ class LieAlert:
         self.auto_follow = bool(la.get("auto_follow", self.auto_follow))
         self.heatmap_enable = bool(
             la.get("heatmap_enable", getattr(self, "heatmap_enable", True))
+        )
+        self.heatmap_only = bool(
+            la.get("heatmap_only", getattr(self, "heatmap_only", False))
         )
         self.predict_coast_s = float(
             la.get("predict_coast_s", getattr(self, "predict_coast_s", 0.30))
@@ -1330,6 +1337,7 @@ class LieAlert:
             f"[LieAlert] session start — follow in "
             f"{delay:.1f}s hit={hit} "
             f"(auto_follow={self.auto_follow}, "
+            f"heatmap_only={bool(getattr(self, 'heatmap_only', False))}, "
             f"shapes={len(self._shape_list)}, bg_sub={self.use_bg_subtractor}, "
             f"record={int(self.record_clip)})"
         )
@@ -1450,13 +1458,115 @@ class LieAlert:
             self._last_score = best_pass_score
             if best_pass_tl is not None:
                 self._lie_title_tl = best_pass_tl
+                self._lie_title_tl_t = time.time()
             return (
                 True,
                 f"tmpl:{os.path.basename(best_pass_path)}",
                 self._is_cn_title_template(best_pass_path),
             )
+        # Native-scale miss: try multi-scale CN title (scaled client / DPI).
+        scaled_tl = self._match_title_tl_multiscale(gray, roi, rx0, ry0)
+        if scaled_tl is not None:
+            self._lie_title_tl = scaled_tl
+            self._lie_title_tl_t = time.time()
+            self._last_score = float(getattr(self, "_title_ms_score", 0.05) or 0.05)
+            return True, "tmpl:lie_multiscale", True
         self._last_score = best_any_score
         return False, "", False
+
+    def _match_title_tl_multiscale(
+        self,
+        gray,
+        roi,
+        ox: int,
+        oy: int,
+    ):
+        """
+        Find CN lie title at non-native UI scale. Returns frame (x,y) or None.
+        Uses SQDIFF; accepts looser thr than native because resize softens edges.
+        """
+        tmpl = None
+        for path, t in self._tmpl_list:
+            if self._is_intro_template(path):
+                continue
+            if self._is_cn_title_template(path) or os.path.basename(path).lower() in (
+                "lie.png",
+                "lie_en.png",
+            ):
+                tmpl = t
+                if self._is_cn_title_template(path) or os.path.basename(path).lower() == "lie.png":
+                    break
+        if tmpl is None:
+            return None
+        search = roi if roi is not None and roi.size > 0 else gray
+        sh, sw = search.shape[:2]
+        th0, tw0 = tmpl.shape[:2]
+        best = (1.0, None)  # score, (x,y) in search
+        for scale in (0.70, 0.80, 0.90, 1.00, 1.10, 1.20):
+            tw = max(8, int(round(tw0 * scale)))
+            th = max(8, int(round(th0 * scale)))
+            if th >= sh or tw >= sw:
+                continue
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            try:
+                tt = cv2.resize(tmpl, (tw, th), interpolation=interp)
+                res = cv2.matchTemplate(search, tt, cv2.TM_SQDIFF_NORMED)
+                min_val, _, min_loc, _ = cv2.minMaxLoc(res)
+                min_val = float(min_val)
+            except Exception:
+                continue
+            if not np.isfinite(min_val):
+                continue
+            # Slightly looser than native CN title thr when scaled.
+            thr = float(self.cn_title_match_threshold) * (1.35 if scale != 1.0 else 1.0)
+            thr = min(0.08, max(thr, 0.025))
+            if min_val <= thr and min_val < best[0]:
+                best = (min_val, (int(min_loc[0]), int(min_loc[1])))
+        if best[1] is None:
+            return None
+        self._title_ms_score = best[0]
+        return (int(ox + best[1][0]), int(oy + best[1][1]))
+
+    def _refresh_lie_anchors(self, img_bgr, now: float) -> None:
+        """Keep title_tl / puzzle box aligned for gostart crop (engineering parity)."""
+        if img_bgr is None:
+            return
+        fh, fw = img_bgr.shape[:2]
+        # Periodic template / multiscale title refresh.
+        if (int(getattr(self, "_title_tl_refresh_i", 0) or 0) % 6) == 0:
+            before = getattr(self, "_lie_title_tl", None)
+            found, _, _ = self._match_templates(img_bgr)
+            title_tl = getattr(self, "_lie_title_tl", None)
+            if title_tl is None:
+                # Extra top-strip multiscale (full-width title bar).
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                top_h = max(28, min(80, fh // 8))
+                top = gray[0:top_h, :]
+                title_tl = self._match_title_tl_multiscale(gray, top, 0, 0)
+                if title_tl is not None:
+                    self._lie_title_tl = title_tl
+                    self._lie_title_tl_t = float(now)
+            if title_tl is None and before is not None:
+                age = float(now) - float(getattr(self, "_lie_title_tl_t", 0.0) or 0.0)
+                if age < 2.5:
+                    self._lie_title_tl = before
+                    title_tl = before
+            if title_tl is None or not found:
+                # Chrome fallback: light title bar + footer → synthetic title + puzzle.
+                try:
+                    from src.engine.lie_heatmap_tracker import estimate_lie_chrome
+
+                    chrome = estimate_lie_chrome(img_bgr)
+                except Exception:
+                    chrome = None
+                if chrome is not None:
+                    ctl, puzzle = chrome
+                    if self._lie_title_tl is None:
+                        self._lie_title_tl = ctl
+                        self._lie_title_tl_t = float(now)
+                    self._lie_puzzle_xyxy = puzzle
+        self._title_tl_refresh_i = int(getattr(self, "_title_tl_refresh_i", 0) or 0) + 1
+
     @staticmethod
     def _normalize_ocr_text(s: str) -> str:
         return "".join(ch for ch in str(s).upper() if not ch.isspace())
@@ -1783,18 +1893,54 @@ class LieAlert:
         prev_tick = float(getattr(self, "_follow_tick_t", 0.0) or 0.0)
         gap = (now - prev_tick) if prev_tick > 0 else 0.0
         self._follow_tick_t = now
-        pt = self._locate_shape(img_bgr, now)
-        name = getattr(self, "_last_shape_name", "") or ""
         hm = getattr(self, "_heatmap", None)
+        heatmap_only = bool(getattr(self, "heatmap_only", False))
+        self._refresh_lie_anchors(img_bgr, now)
+        # heatmap_only: never run classic locate (gostart has none). Hybrid still
+        # uses locate for opening white + inject until heatmap is armed.
+        if heatmap_only:
+            pt = None
+            name = ""
+        elif hm is not None and bool(getattr(hm, "opening_confirmed", False)):
+            pt = None
+            name = ""
+        else:
+            pt = self._locate_shape(img_bgr, now)
+            name = getattr(self, "_last_shape_name", "") or ""
 
-        # --- gostart-style: confirm opening white before any mouse move ---
+        # --- gostart-style: confirm opening before any mouse move ---
         if hm is not None and not hm.opening_confirmed:
             white_hit = (
                 pt is not None
                 and name == "white"
                 and float(getattr(self, "_white_gone_t", 0.0) or 0.0) <= 0.0
             )
-            if white_hit:
+            # heatmap_only: arm from ONNX peak (bright opening blob), not YOLO/white CV.
+            peak_hit = False
+            if heatmap_only:
+                try:
+                    fh, fw = img_bgr.shape[:2]
+                    dialog_xyxy = getattr(self, "_lie_puzzle_xyxy", None) or self._dialog_roi(
+                        fw, fh
+                    )
+                    title_tl = getattr(self, "_lie_title_tl", None)
+                    est0 = hm.push(
+                        img_bgr,
+                        now,
+                        dialog_xyxy=dialog_xyxy,
+                        title_tl=title_tl,
+                    )
+                except Exception:
+                    est0 = None
+                peak_hit = bool(
+                    est0 is not None
+                    and est0.source == "heatmap"
+                    and float(est0.confidence) >= 0.82
+                    and float(est0.secondary_ratio) <= 0.55
+                )
+                if est0 is not None:
+                    self.debug_pt = (int(est0.x), int(est0.y))
+            if white_hit or peak_hit:
                 hm.note_opening_white(True, now)
             else:
                 hm.note_opening_white(False, now)
@@ -1804,21 +1950,22 @@ class LieAlert:
                 self._last_seen_t = now
             if not hm.opening_confirmed:
                 if hm.opening_timed_out(now):
-                    # Timeout: still arm follow (heatmap + classic), don't stay alert-only forever.
+                    # Timeout: still arm follow; don't stay alert-only forever.
                     hm._opening_confirmed = True
                     hm._active = True
+                    mode = "heatmap-only" if heatmap_only else "heatmap/classic"
                     logger.info(
-                        "[LieAlert] opening_confirm timeout — arm follow "
-                        "(heatmap/classic fallback)"
+                        f"[LieAlert] opening_confirm timeout — arm follow ({mode})"
                     )
                 else:
                     self.following = False
                     if now - float(getattr(self, "_opening_log_t", 0.0) or 0.0) > 1.0:
                         self._opening_log_t = now
+                        how = "peak" if heatmap_only else "white"
                         logger.info(
                             f"[LieAlert] opening_confirm "
                             f"hits={hm._opening_hits}/{hm.opening_confirm_frames} "
-                            f"(no mouse until white locked)"
+                            f"via={how} (no mouse until locked)"
                         )
                     return
             if not getattr(self, "_opening_confirm_logged", False):
@@ -1859,31 +2006,32 @@ class LieAlert:
         move_pt = None
         move_src = ""
 
-        # Heatmap path (preferred after confirm)
+        # Heatmap path (preferred after confirm; exclusive when heatmap_only)
         if hm is not None and hm.opening_confirmed:
             inject = None
             inj_w = 0.0
-            if pt is not None and name in (
-                "white",
-                "yolo",
-                "fill",
-                "faded",
-                "outlier",
-                "spinback",
+            # gostart has no YOLO/classic inject. heatmap_only: no soft inject at all.
+            # Hybrid mode may still inject white / solid locate into the measurement.
+            if (
+                not heatmap_only
+                and pt is not None
+                and name in (
+                    "white",
+                    "yolo",
+                    "fill",
+                    "faded",
+                    "outlier",
+                    "spinback",
+                )
             ):
                 inject = (float(pt[0]), float(pt[1]))
                 inj_w = 0.55 if name == "white" else 0.35
             try:
                 fh, fw = img_bgr.shape[:2]
-                dialog_xyxy = self._dialog_roi(fw, fh)
-                # Refresh title TL occasionally so puzzle crop stays gostart-aligned.
+                dialog_xyxy = getattr(self, "_lie_puzzle_xyxy", None) or self._dialog_roi(
+                    fw, fh
+                )
                 title_tl = getattr(self, "_lie_title_tl", None)
-                if (int(getattr(self, "_title_tl_refresh_i", 0) or 0) % 8) == 0:
-                    self._match_templates(img_bgr)
-                    title_tl = getattr(self, "_lie_title_tl", None)
-                self._title_tl_refresh_i = int(
-                    getattr(self, "_title_tl_refresh_i", 0) or 0
-                ) + 1
                 est = hm.push(
                     img_bgr,
                     now,
@@ -1904,9 +2052,35 @@ class LieAlert:
                 move_pt = (float(est.x), float(est.y))
                 move_src = f"heatmap/{est.source}"
                 self.debug_pt = (int(est.x), int(est.y))
+            elif (
+                heatmap_only
+                and est is not None
+                and est.source == "predict"
+                and move_pt is None
+            ):
+                # Brief velocity coast after last accepted heatmap (not stale snap).
+                last_acc = float(getattr(hm, "_last_accept_t", 0.0) or 0.0)
+                coast_s = max(
+                    0.45, float(getattr(self, "predict_coast_s", 0.30) or 0.30)
+                )
+                if last_acc > 0.0 and (now - last_acc) < coast_s:
+                    try:
+                        pest = hm.predict_coast()
+                    except Exception:
+                        pest = None
+                    if pest is not None and float(pest.confidence) >= 0.12:
+                        move_pt = (float(pest.x), float(pest.y))
+                        move_src = "heatmap/predict"
+                        self.debug_pt = (int(pest.x), int(pest.y))
 
-        # Classic locate fallback (solid detections only — fail-closed vs coast)
-        if move_pt is None and pt is not None and name not in ("coast", "flow", "patch", "motion"):
+        # Classic locate fallback (solid detections only — fail-closed vs coast).
+        # heatmap_only: never move from locate; short predict_coast below only.
+        if (
+            not heatmap_only
+            and move_pt is None
+            and pt is not None
+            and name not in ("coast", "flow", "patch", "motion")
+        ):
             white_phase = name == "white" and float(
                 getattr(self, "_white_gone_t", 0.0) or 0.0
             ) <= 0.0
@@ -1938,8 +2112,12 @@ class LieAlert:
             self._move_mouse_to_frame_point(move_pt, capture)
             if now - self._follow_log_t > 1.0:
                 self._follow_log_t = now
+                crop_m = "-"
+                if hm is not None:
+                    crop_m = str(getattr(hm, "_crop_mode", "-") or "-")
                 logger.info(
-                    f"[LieAlert] following shape={move_src} locked={self._locked} @ "
+                    f"[LieAlert] following shape={move_src} locked={self._locked} "
+                    f"crop={crop_m} title={getattr(self, '_lie_title_tl', None)} @ "
                     f"frame=({move_pt[0]:.0f},{move_pt[1]:.0f})"
                 )
             return
@@ -3554,13 +3732,18 @@ class LieAlert:
         """Load peak/YOLO in a daemon so the first follow frames stay responsive."""
         if bool(getattr(self, "_track_models_warming", False)):
             return
-        if self._shape_peak_model is not None and self._fade_yolo is not None:
+        heatmap_only = bool(getattr(self, "heatmap_only", False))
+        if self._shape_peak_model is not None and (
+            heatmap_only or self._fade_yolo is not None
+        ):
             return
         self._track_models_warming = True
 
         def _job():
             try:
                 self._ensure_shape_peak_model(allow_block=True)
+                if bool(getattr(self, "heatmap_only", False)):
+                    return
                 yolo = self._ensure_fade_yolo(allow_block=True)
                 # First ultralytics predict is slow — burn it off-thread.
                 if yolo is not None:
@@ -3595,6 +3778,8 @@ class LieAlert:
         threading.Thread(target=_job, daemon=True, name="lie-warm-models").start()
 
     def _ensure_fade_yolo(self, allow_block: bool = True):
+        if bool(getattr(self, "heatmap_only", False)):
+            return None
         if self._fade_yolo_failed:
             return None
         if self._fade_yolo is not None:
@@ -3635,6 +3820,8 @@ class LieAlert:
         current center, not the highest score.
         Returns (conf, cx, cy, bbox) or None.
         """
+        if bool(getattr(self, "heatmap_only", False)):
+            return None
         # Never sync-load on the follow path.
         model = self._ensure_fade_yolo(allow_block=False)
         if model is None:

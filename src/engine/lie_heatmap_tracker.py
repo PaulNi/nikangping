@@ -75,6 +75,122 @@ def puzzle_rect_from_title(
     return (x0, y0, x1, y1)
 
 
+def puzzle_rect_from_title_scaled(
+    title_tl: Tuple[int, int],
+    frame_w: int,
+    frame_h: int,
+) -> Optional[Tuple[Tuple[int, int, int, int], float]]:
+    """
+    Title→puzzle when the client is not native 752×501 (scaled UI).
+
+    Returns ((x0,y0,x1,y1), scale) where scale maps resized crop back to frame
+    (sx=sy=scale after resize to 752×501).
+    """
+    exact = puzzle_rect_from_title(title_tl, frame_w, frame_h)
+    if exact is not None:
+        return exact, 1.0
+    tx, ty = int(title_tl[0]), int(title_tl[1])
+    dl, dt = PUZZLE_FROM_TITLE[0], PUZZLE_FROM_TITLE[1]
+    # How much room remains for the puzzle under the title.
+    max_w = max(0, frame_w - (tx + dl) - 2)
+    max_h = max(0, frame_h - (ty + dt) - 2)
+    if max_w < 120 or max_h < 90:
+        return None
+    scale = min(1.0, float(max_w) / float(CROP_W), float(max_h) / float(CROP_H))
+    if scale < 0.50:
+        return None
+    x0 = int(round(tx + dl * scale))
+    y0 = int(round(ty + dt * scale))
+    x1 = int(round(x0 + CROP_W * scale))
+    y1 = int(round(y0 + CROP_H * scale))
+    x0 = max(0, min(frame_w - 2, x0))
+    y0 = max(0, min(frame_h - 2, y0))
+    x1 = max(x0 + 8, min(frame_w, x1))
+    y1 = max(y0 + 8, min(frame_h, y1))
+    if (x1 - x0) < 80 or (y1 - y0) < 60:
+        return None
+    return (x0, y0, x1, y1), float(scale)
+
+
+def estimate_lie_chrome(
+    frame_bgr: np.ndarray,
+) -> Optional[Tuple[Tuple[int, int], Tuple[int, int, int, int]]]:
+    """
+    Infer (title_tl, puzzle_xyxy) from light title bar + instruction footer.
+
+    Works for window-filling 测谎 UI and mid-screen dialogs with pale chrome.
+    """
+    if frame_bgr is None or frame_bgr.size < 100:
+        return None
+    fh, fw = frame_bgr.shape[:2]
+    if fh < 120 or fw < 160:
+        return None
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    row_mean = gray.mean(axis=1)
+    row_std = gray.std(axis=1)
+
+    def _light_runs(y0: int, y1: int, thr: float = 165.0, max_std: float = 48.0):
+        runs = []
+        a = None
+        for y in range(max(0, y0), min(fh, y1)):
+            ok = float(row_mean[y]) >= thr and float(row_std[y]) <= max_std
+            if ok and a is None:
+                a = y
+            elif not ok and a is not None:
+                runs.append((a, y))
+                a = None
+        if a is not None:
+            runs.append((a, min(fh, y1)))
+        return runs
+
+    top_runs = _light_runs(0, max(24, fh // 5))
+    bot_runs = _light_runs(min(fh - 8, (fh * 4) // 5), fh)
+    if not top_runs:
+        return None
+    # Prefer a short title strip near the top.
+    top_runs.sort(key=lambda r: (r[1] - r[0], r[0]))
+    ty0, ty1 = None, None
+    for a, b in top_runs:
+        ht = b - a
+        if 8 <= ht <= max(28, fh // 12):
+            ty0, ty1 = a, b
+            break
+    if ty0 is None:
+        # Fall back to the topmost light run clipped to a title-like height.
+        a, b = top_runs[0]
+        ty0, ty1 = a, min(b, a + max(14, fh // 30))
+    foot_top = fh - max(20, fh // 12)
+    if bot_runs:
+        # Lowest band with reasonable footer height.
+        bot_runs.sort(key=lambda r: -r[0])
+        for a, b in bot_runs:
+            if 16 <= (b - a) <= max(70, fh // 6):
+                foot_top = a
+                break
+    y0 = int(ty1 + 1)
+    y1 = int(max(y0 + 40, foot_top - 1))
+    if y1 - y0 < 60:
+        return None
+    # Inset sides slightly; if side columns are dark game chrome, trim more.
+    x0, x1 = int(fw * 0.02), int(fw * 0.98)
+    strip = gray[y0:y1, :]
+    if strip.size > 0:
+        col_mean = strip.mean(axis=0)
+        # Walk in from sides while clearly darker than puzzle field.
+        field = float(np.median(col_mean[int(fw * 0.2) : int(fw * 0.8)]))
+        left = 0
+        while left < fw // 4 and float(col_mean[left]) < field - 25.0:
+            left += 1
+        right = fw - 1
+        while right > (fw * 3) // 4 and float(col_mean[right]) < field - 25.0:
+            right -= 1
+        if right - left >= 120:
+            x0, x1 = left, right + 1
+    title_tl = (max(0, x0 + 2), int(ty0))
+    puzzle = (int(x0), int(y0), int(x1), int(y1))
+    return title_tl, puzzle
+
+
 def extract_puzzle_crop(
     frame_bgr: np.ndarray,
     dialog_xyxy: Optional[Tuple[int, int, int, int]] = None,
@@ -86,15 +202,23 @@ def extract_puzzle_crop(
       frame_y = oy + local_y * sy
 
     Prefer gostart title→puzzle offsets when `title_tl` is known.
+    Falls back to scaled title crop or dialog ROI resize for non-native clients.
     """
     fh, fw = frame_bgr.shape[:2]
     if title_tl is not None:
-        rect = puzzle_rect_from_title(title_tl, fw, fh)
-        if rect is not None:
-            x0, y0, x1, y1 = rect
-            crop = frame_bgr[y0:y1, x0:x1]
-            if crop.shape[0] == CROP_H and crop.shape[1] == CROP_W:
-                return crop, float(x0), float(y0), 1.0, 1.0
+        scaled = puzzle_rect_from_title_scaled(title_tl, fw, fh)
+        if scaled is not None:
+            (x0, y0, x1, y1), scale = scaled
+            patch = frame_bgr[y0:y1, x0:x1]
+            if patch.size >= 64:
+                if scale >= 0.995 and patch.shape[0] == CROP_H and patch.shape[1] == CROP_W:
+                    return patch, float(x0), float(y0), 1.0, 1.0
+                crop = cv2.resize(
+                    patch, (CROP_W, CROP_H), interpolation=cv2.INTER_AREA
+                )
+                sx = float(x1 - x0) / float(CROP_W)
+                sy = float(y1 - y0) / float(CROP_H)
+                return crop, float(x0), float(y0), sx, sy
 
     if dialog_xyxy is None:
         x0, y0 = int(fw * 0.22), int(fh * 0.22)
@@ -247,6 +371,12 @@ class LieHeatmapTracker:
         self.innovation_gate_speed_px_s = 180.0
         self.innovation_gate_max_dt_s = 0.35
         self.observation_min_confidence = 0.60
+        # After short predict-only coast, re-lock if a confident peak clusters.
+        self.prediction_only_frames = 2
+        self.far_reloc_confirm_frames = 3
+        self.far_reloc_radius_px = 50.0
+        # Hard break-out if gate keeps rejecting forever (heatmap-only freeze).
+        self.predict_stuck_frames = 8
         self.calib_coeffs = {
             "intercept": -0.1727907,
             "normalized_heatmap_concentration": 1.84598363,
@@ -266,6 +396,10 @@ class LieHeatmapTracker:
         self._last_work_xy = None
         self._last_local_xy = None  # crop-local accepted track
         self._last_push_t = 0.0
+        self._last_accept_t = 0.0
+        self._predict_streak = 0
+        self._reloc_xy = None  # crop-local cluster center while rejecting
+        self._reloc_hits = 0
         self._opening_hits = 0
         self._opening_confirmed = False
         self._opening_start_t = 0.0
@@ -325,9 +459,23 @@ class LieHeatmapTracker:
         )
         self.boundary_cap = float(cal.get("boundary_confidence_cap", self.boundary_cap))
         safety = meta.get("tracking_safety") or {}
-        # JSON uses a string formula; keep numeric defaults unless overridden in lie_alert.
-        if "held_out_normal_motion_coverage" in safety:
-            pass  # informational only
+        self.prediction_only_frames = max(
+            1, int(safety.get("prediction_only_frames", self.prediction_only_frames))
+        )
+        self.far_reloc_confirm_frames = max(
+            1,
+            int(
+                safety.get(
+                    "far_relocalization_confirmation_frames",
+                    self.far_reloc_confirm_frames,
+                )
+            ),
+        )
+        self.far_reloc_radius_px = float(
+            safety.get(
+                "far_relocalization_cluster_radius_px", self.far_reloc_radius_px
+            )
+        )
 
     def _ensure_session(self) -> bool:
         if self._sess is not None:
@@ -360,6 +508,10 @@ class LieHeatmapTracker:
         self._last_work_xy = None
         self._last_local_xy = None
         self._last_push_t = 0.0
+        self._last_accept_t = 0.0
+        self._predict_streak = 0
+        self._reloc_xy = None
+        self._reloc_hits = 0
         self._opening_hits = 0
         self._opening_confirmed = False
         self._opening_start_t = float(now or 0.0)
@@ -500,12 +652,19 @@ class LieHeatmapTracker:
         if self._last_push_t > 0:
             dt = max(0.0, float(now) - float(self._last_push_t))
         accept_obs = True
+        raw_conf = 1.0
+        reloc_lock = False
         if self._last_local_xy is not None:
             prev_lx, prev_ly = self._last_local_xy
             innov = float(
                 ((meas_lx - prev_lx) ** 2 + (meas_ly - prev_ly) ** 2) ** 0.5
             )
             gate = self._innovation_gate_px(dt)
+            # After fade / while already coasting, widen gate so a spinning
+            # target is not permanently rejected (live predict freeze).
+            streak = int(getattr(self, "_predict_streak", 0) or 0)
+            if self._active and streak > 0:
+                gate *= 1.0 + min(1.25, 0.25 * float(streak))
             raw_sec = _secondary_peak_ratio(meas, self.secondary_excl)
             raw_conf = _calibrated_confidence(
                 meas,
@@ -515,10 +674,61 @@ class LieHeatmapTracker:
                 ambiguity_cap=self.ambiguity_cap,
                 boundary_cap=self.boundary_cap,
             )
-            if innov > gate or raw_conf < float(self.observation_min_confidence):
+            obs_min = float(self.observation_min_confidence)
+            if self._active and streak >= int(self.prediction_only_frames):
+                obs_min *= 0.90
+            if innov > gate or raw_conf < obs_min:
                 accept_obs = False
+
+        # gostart-style far relocalization: confident peaks that cluster while
+        # coasting are allowed to re-enter (breaks heatmap-only predict freeze).
+        if not accept_obs:
+            self._predict_streak = int(getattr(self, "_predict_streak", 0) or 0) + 1
+            conf_ok = float(raw_conf) >= float(self.observation_min_confidence) * 0.92
+            if conf_ok and self._predict_streak >= int(self.prediction_only_frames):
+                if self._reloc_xy is None:
+                    self._reloc_xy = (float(meas_lx), float(meas_ly))
+                    self._reloc_hits = 1
+                else:
+                    rx, ry = self._reloc_xy
+                    d = float(
+                        ((meas_lx - rx) ** 2 + (meas_ly - ry) ** 2) ** 0.5
+                    )
+                    if d <= float(self.far_reloc_radius_px):
+                        self._reloc_hits = int(self._reloc_hits) + 1
+                        # Pull cluster center toward new peak.
+                        self._reloc_xy = (
+                            0.7 * rx + 0.3 * float(meas_lx),
+                            0.7 * ry + 0.3 * float(meas_ly),
+                        )
+                    else:
+                        self._reloc_xy = (float(meas_lx), float(meas_ly))
+                        self._reloc_hits = 1
+                if int(self._reloc_hits) >= int(self.far_reloc_confirm_frames):
+                    accept_obs = True
+                    reloc_lock = True
+            # Emergency: gate rejected too long with a usable peak — snap once.
+            if (
+                not accept_obs
+                and conf_ok
+                and self._predict_streak >= int(self.predict_stuck_frames)
+            ):
+                accept_obs = True
+                reloc_lock = True
+        else:
+            self._predict_streak = 0
+            self._reloc_xy = None
+            self._reloc_hits = 0
+
         if accept_obs or self._belief is None:
+            if reloc_lock:
+                # Jump belief onto the new measurement instead of coasting in.
+                self._belief = None
+                self._vel[:] = 0
             belief = self._update_belief(meas)
+            self._predict_streak = 0
+            self._reloc_xy = None
+            self._reloc_hits = 0
         else:
             # Reject observation: coast belief with velocity only.
             prior = self._belief
@@ -565,12 +775,20 @@ class LieHeatmapTracker:
 
         lx, ly = work_to_local((wx, wy))
         if accept_obs:
+            # Prefer measurement peak after reloc so cursor jumps to new lock.
+            if reloc_lock:
+                lx, ly = float(meas_lx), float(meas_ly)
+                wx, wy = local_to_work((lx, ly))
+                self._last_work_xy = (wx, wy)
             self._last_local_xy = (lx, ly)
+            self._last_accept_t = float(now)
         self._last_push_t = float(now)
 
         fx = ox + lx * sx
         fy = oy + ly * sy
         src = "heatmap" if accept_obs else "predict"
+        if accept_obs and reloc_lock:
+            src = "heatmap"
         if accept_obs and inject_xy is not None and inject_weight >= 0.5:
             src = "inject"
         est = HeatmapEstimate(

@@ -195,9 +195,9 @@ walk_teleport:
 # 多角色 / 模式：启动空闲；F1 / F2 / F3 加载对应配置并开始（再按同键关闭）
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 测谎 / 谎言探测仪（笔记本：只报警不跟形）
+# 测谎 / 谎言探测仪（笔记本：gostart 热力图跟形；不开 YOLO）
 #   - 模板一命中立刻响铃并暂停挂机——「小游戏出现提醒」
-#   - auto_follow=false：不移鼠、不跑 YOLO/热力图跟形（本机无 CUDA，CPU 跟形易掉帧）
+#   - auto_follow + heatmap_only：鼠标只由 lie-detector-observation.onnx 驱动
 # ---------------------------------------------------------------------------
 lie_alert:
   enable: true
@@ -235,16 +235,17 @@ lie_alert:
     - "逐渐透明且移动"
     - "LIE DETECTOR"
     - "Lie Detector"
-  auto_follow: false
+  auto_follow: true
   # gostart lie-detector-observation.onnx（特征对齐 _build_features，/255）
-  heatmap_enable: false
+  heatmap_enable: true
+  heatmap_only: true             # 只热力图跟形：不加载/不推理 Fade YOLO，经典 locate 不移鼠
   heatmap_model: "assets/lie_detector/lie-detector-observation.onnx"
   heatmap_meta: "assets/lie_detector/lie-detector-observation.json"
   opening_confirm_frames: 4      # 连续白形命中后才首次移鼠
   opening_confirm_timeout_s: 8.0 # 超时后仍武装，改走热力图/经典回退
   control_min_confidence: 0.60   # 对标 gostart OBSERVED_CONTROL_MIN_CONFIDENCE
   heatmap_ambiguity_secondary_ratio: 0.78
-  predict_coast_s: 0.30          # 短时预测跟（光标）；内部 RED 仍可用 lose_target_grace
+  predict_coast_s: 0.75          # 拒观测后短时 coast；配合远距离重锁，避免 heatmap-only 僵死
   record_clip: false
   record_dir: "_debug_out/lie_clips"
   record_fps: 30
